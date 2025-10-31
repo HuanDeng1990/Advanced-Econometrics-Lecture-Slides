@@ -1,2 +1,8 @@
 Codes used in Master's Econometrics.
 1. OLS, OVB, Bootstrap, and Fisher's Tests
+2. Unconfoundedness: Simpson's Paradox, Estimators that exploit unconfoundedness
+3. IV: Simultaneity, IV Estimators, and LATE
+4. RD and Simulated IV
+5. Difference-in-differences Estimators
+6. Synthetic Control Method and Synthetic DiD
+7. Machine Learning in Econometrics: Lasso, K-means, Causal Forest, and Double Machine Learning
