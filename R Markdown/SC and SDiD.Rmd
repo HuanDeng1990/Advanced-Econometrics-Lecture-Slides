@@ -1,0 +1,125 @@
+---
+title: SC & SDID on California Prop 99 
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+  pdf_document:
+    toc: true
+---
+
+
+> data frame called **`california_prop99`** with the **exact columns**:
+> `State`, `Year`, `PacksPerCapita`, `treated` (0/1). The code converts this table to the
+> matrix inputs required by **`synthdid`** and then runs SC, DiD, and SDID.
+
+### 0) Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+# If needed: install.packages(c("synthdid","ggplot2","dplyr","tibble"))
+library(synthdid)
+library(ggplot2)
+library(dplyr)
+library(tibble)
+
+theme_set(theme_minimal(base_size = 12))
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4)
+
+# Safe table helper (works with or without kableExtra)
+kb <- function(x, ...) {
+  out <- knitr::kable(x, ...)
+  if (requireNamespace("kableExtra", quietly = TRUE)) {
+    kableExtra::kable_styling(out, full_width = FALSE)
+  } else out
+}
+
+# Compatibility shim: older notes sometimes call synthdid::weights();
+# the current package exposes synthdid::weights() as the S3 method. Alias if missing.
+if (!exists('synthdid_weights')) synthdid_weights <- function(obj) synthdid::weights(obj)
+```
+
+
+### 1) Convert the tidy table to synthdid matrices (Y, N0, T0)
+
+```{r load-data}
+# --- Expect a data.frame named `california_prop99` with columns:
+# State, Year, PacksPerCapita, treated (0/1). ---
+stopifnot(exists("california_prop99"), is.data.frame(california_prop99))
+
+req <- c("State","Year","PacksPerCapita","treated")
+missing <- setdiff(req, names(california_prop99))
+if (length(missing) > 0) {
+  stop("`california_prop99` is missing required columns: ", paste(missing, collapse = ", "))
+}
+
+df <- california_prop99 %>%
+  dplyr::rename_with(tolower) %>%
+  dplyr::mutate(treated = as.integer(treated))
+
+# Build matrices for synthdid
+pm <- synthdid::panel.matrices(df,
+                               unit      = "state",
+                               time      = "year",
+                               outcome   = "packspercapita",
+                               treatment = "treated")
+Y  <- pm$Y      # unit × time matrix
+N0 <- pm$N0     # number of donor units
+T0 <- pm$T0     # last pre‑treatment time index
+
+# Sanity checks
+cat("dim(Y) =", paste(dim(Y), collapse=" x "), " | N0 =", N0, " | T0 =", T0, "\n")
+
+# Peek at the tidy data
+kb(head(df, 10), caption = "Tidy input: State–Year–PacksPerCapita–treated")
+```
+
+### 2) Estimates: SC vs DiD vs SDID
+
+```{r estimates}
+# Synthetic Control
+tau_sc   <- sc_estimate(Y, N0, T0)
+# Classical DiD on the same Y‑matrix
+tau_did  <- did_estimate(Y, N0, T0)
+# Synthetic DiD
+tau_sdid <- synthdid_estimate(Y, N0, T0)
+
+tau_sc; tau_did; tau_sdid
+```
+
+**Paths (treated vs. synthetic)**
+
+```{r paths}
+# Use synthdid_plot() which returns a ggplot object; add titles with ggtitle()
+p_sc   <- synthdid::synthdid_plot(tau_sc)
+p_sdid <- synthdid::synthdid_plot(tau_sdid,overlay=1, se.method='placebo')
+print(p_sc   + ggplot2::ggtitle("Synthetic Control (SC) — Treated vs Synthetic"))
+print(p_sdid + ggplot2::ggtitle("Synthetic DiD (SDID) — Treated vs Synthetic"))
+```
+
+**Point estimates and uncertainty**
+
+```{r se}
+se_sc   <- sqrt(vcov(tau_sc))
+se_did  <- sqrt(vcov(tau_did))
+se_sdid <- sqrt(vcov(tau_sdid))
+
+est_tab <- tibble(
+  method = c("SC","DiD","SDID"),
+  tau    = c(as.numeric(tau_sc), as.numeric(tau_did), as.numeric(tau_sdid)),
+  se     = c(se_sc, se_did, se_sdid)
+) |> mutate(ci_lo = tau - 1.96*se, ci_hi = tau + 1.96*se)
+
+kb(est_tab, digits = 3, caption = "Point estimates and 95% CIs")
+```
+
+### 3) Inspect SDID weights (
+
+```{r weights}
+estimates = list(tau_did, tau_sc, tau_sdid)
+names(estimates) = c('Diff-in-Diff', 'Synthetic Control', 'Synthetic Diff-in-Diff')
+synthdid_plot(estimates, se.method='placebo')
+synthdid_units_plot(estimates, se.method='placebo')
+```
+
+

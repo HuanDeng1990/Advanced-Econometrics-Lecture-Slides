@@ -1,0 +1,394 @@
+---
+title: "Instrumental Variables — Simultaneity, IV Estimators, and LATE"
+author: "Huan Deng"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+This single R Markdown file aligns with the lecture slides on **Simultaneity & Selection** (pp. 8–9), **IV Estimator & TSLS** (pp. 12–17), and **LATE & Assumptions** (pp. 23–38). 
+
+> **How to use**: Knit top‑to‑bottom, or run each section independently. The setup chunk installs needed packages if missing.
+
+---
+
+## 0) Setup and common libraries
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(fig.width=7, fig.height=4.6, dpi=120)
+pkgs <- c("AER","MASS","sandwich","lmtest","ggplot2","dplyr","broom")
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) {
+  install.packages(p, repos = "https://cloud.r-project.org")
+}
+suppressPackageStartupMessages({
+  library(AER)        # ivreg (2SLS)
+  library(MASS)       # mvrnorm (simulation)
+  library(sandwich)   # vcovHC for robust SEs
+  library(lmtest)     # coeftest
+  library(ggplot2)    # plots
+  library(dplyr)      # data wrangling
+  library(broom)      # tidy summaries
+})
+set.seed(1)
+theme_set(theme_minimal(base_size = 13))
+```
+
+---
+
+# PART I — Simultaneity & Selection (Motivation for IV)
+
+> **Slides:** Simultaneous equations (p. 8), selection (p. 9). The goal is to see **why OLS fails** and **what an instrument fixes**. 
+
+## 1) Simultaneity: supply & demand → endogenous price
+
+**Idea.** Equilibrium price `P` depends on *both* demand and supply shocks. Regressing `Q` on `P`—even with a single shifter control—**does not** identify either curve’s slope. With a **demand shifter** `Zd`, you can IV‑identify **supply**; with a **supply shifter** `Zs`, you can IV‑identify **demand**.
+
+```{r sd-simulate}
+# Structural parameters
+n  <- 5000
+a1 <- 0; b1 <- -0.8; t1 <- 1.0  # demand: Qd = a1 + b1*P + t1*Zd + u1  (b1 < 0)
+a2 <- 0; b2 <-  0.6; t2 <- 1.0  # supply: Qs = a2 + b2*P + t2*Zs + u2  (b2 > 0)
+
+Zd <- rnorm(n)                  # demand shifter (e.g., income)
+Zs <- rnorm(n)                  # supply shifter (e.g., cost)
+u1 <- rnorm(n)                  # demand shock
+u2 <- rnorm(n)                  # supply shock
+
+# Market equilibrium: solve Qd = Qs for P, then compute Q (slides p. 8)
+P <- (a2 - a1 + t2*Zs - t1*Zd + u2 - u1) / (b1 - b2)   # <-- endogenous in u1 & u2
+Q <- a1 + b1*P + t1*Zd + u1                            # realized quantity at equilibrium
+
+dat <- data.frame(Q, P, Zd, Zs, u1, u2)
+```
+
+**Why OLS is biased** (endogeneity check):
+```{r sd-corr}
+c(cor_P_u1 = cor(dat$P, dat$u1),   # corr(P, demand shock)   <-- nonzero
+  cor_P_u2 = cor(dat$P, dat$u2))   # corr(P, supply shock)   <-- nonzero
+```
+
+### 1A) Two OLS with shifter controls (still wrong)
+
+> Even after controlling for a shifter, `P` remains endogenous—so the slope on `P` is **not** the structural slope.
+
+```{r sd-ols-two}
+ols_demand_like <- lm(Q ~ P + Zd, data = dat)  # includes demand shifter
+ols_supply_like <- lm(Q ~ P + Zs, data = dat)  # includes supply shifter
+rbind(
+  `True demand slope b1` = b1,
+  `OLS slope on P in Q~P+Zd` = coef(ols_demand_like)["P"],
+  `True supply slope  b2` = b2,
+  `OLS slope on P in Q~P+Zs` = coef(ols_supply_like)["P"]
+)
+```
+
+**Why bias persists:** The partial correlation between `P` and the relevant structural error remains non‑zero even after partialling out the shifter.
+
+```{r sd-partial}
+# Partial corr of P with demand error u1, given Zd
+p_resid_d <- resid(lm(P ~ Zd, data = dat))
+c(partial_cor_Pu1_given_Zd = cor(p_resid_d, dat$u1))    # <-- still nonzero
+
+# Partial corr of P with supply error u2, given Zs
+p_resid_s <- resid(lm(P ~ Zs, data = dat))
+c(partial_cor_Pu2_given_Zs = cor(p_resid_s, dat$u2))    # <-- still nonzero
+```
+
+### 1B) Use IV with the **opposite** shifter to identify each curve
+
+```{r sd-iv}
+# Identify demand: instrument P with Zs, include Zd as a control (belongs in demand)
+iv_demand <- ivreg(Q ~ P + Zd | Zs + Zd, data = dat)   # <-- key IV spec for demand
+# Identify supply: instrument P with Zd, include Zs as a control (belongs in supply)
+iv_supply <- ivreg(Q ~ P + Zs | Zd + Zs, data = dat)   # <-- key IV spec for supply
+
+list(
+  demand_true_b1 = b1,
+  demand_IV_b1   = coef(summary(iv_demand))["P","Estimate"],
+  supply_true_b2 = b2,
+  supply_IV_b2   = coef(summary(iv_supply))["P","Estimate"]
+)
+```
+
+> **Diagnostic tip (p. 17):** Check `summary(..., diagnostics=TRUE)` for first‑stage F, Wu–Hausman, and Sargan (over‑ID when applicable).
+
+```{r sd-diag, results='hide'}
+summary(iv_demand, diagnostics = TRUE)
+summary(iv_supply, diagnostics = TRUE)
+```
+
+---
+
+## 2) Selection: college attendance & wages
+
+**Idea.** Ability `A` drives both college attendance `D` and wages `Y`, creating **positive selection**. OLS on `D` is biased; controlling for `A` or using a valid instrument `Z` recovers the causal effect.
+
+```{r sel-sim}
+set.seed(2)
+n   <- 10000
+A   <- rnorm(n)             # unobserved ability (drives D and Y)
+Z   <- rbinom(n, 1, 0.5)    # instrument (e.g., proximity/scholarship)
+nu  <- rnorm(n)             # choice shock
+eps <- rnorm(n)             # wage shock
+
+# College choice: D* = g0 + g1*Z + gA*A + nu; D = 1{D* > 0}
+g0 <- -0.2; g1 <- 0.8; gA <- 1.0
+Dstar <- g0 + g1*Z + gA*A + nu
+D     <- as.numeric(Dstar > 0)
+
+# Wage equation: Y = beta*D + tau*A + eps
+beta <- 0.0   # set to zero to highlight pure selection bias
+tau  <- 1.0
+Y    <- beta*D + tau*A + eps
+dd   <- data.frame(Y, D, A, Z)
+```
+
+```{r sel-results}
+cat("cor(D, A) =", round(cor(dd$D, dd$A), 3), "\n")   # <-- selection present
+summary(lm(Y ~ D, data = dd))$coef                    # OLS (biased)
+summary(lm(Y ~ D + A, data = dd))$coef["D",, drop=FALSE]  # OLS controlling for A (unbiased if A observed)
+fit_iv <- ivreg(Y ~ D | Z, data = dd)                 # IV using Z for D
+c(true_beta = beta, iv_beta = coef(summary(fit_iv))["D","Estimate"])
+summary(fit_iv, diagnostics = TRUE)$diagnostics       # first stage, weak-IV checks
+```
+
+> **Takeaway:** Endogeneity from simultaneity or self‑selection **biases OLS**. Valid instruments address the bias by purging endogenous variation in `D`. (Slides pp. 8–9, 12–17.)
+
+---
+
+# PART II — IV Estimators (Wald, Reduced‑Form, TSLS) with Plots
+
+> **Slides:** IV estimator derivations and TSLS (pp. 12–17). We visualize the reduced forms and “project‑then‑regress” intuition. 
+
+## 3) Just‑identified IV (binary Z) — Wald and reduced‑form ratio
+
+```{r iv-sim}
+n <- 4000
+rho <- 0.6
+Sigma <- matrix(c(1, rho, rho, 1), 2, 2)
+eu <- MASS::mvrnorm(n, mu = c(0,0), Sigma = Sigma)
+eps <- eu[,1]; u <- eu[,2]
+Z   <- rbinom(n, 1, 0.5)   # instrument
+pi  <- 0.7                 # first-stage strength
+beta_true <- 1.0
+D <- pi*Z + u
+Y <- 1 + beta_true*D + eps
+dat_iv <- data.frame(Y,D,Z)
+```
+
+```{r iv-wald}
+# Wald = Cov(Y,Z)/Cov(D,Z) = slope(Y~Z) / slope(D~Z)  <-- slides Eq. (8)–(9)
+wald <- cov(dat_iv$Y, dat_iv$Z) / cov(dat_iv$D, dat_iv$Z)
+rfY  <- lm(Y ~ Z, data = dat_iv)
+rfD  <- lm(D ~ Z, data = dat_iv)
+rf_ratio <- coef(rfY)["Z"] / coef(rfD)["Z"]            # reduced-form ratio
+fit_iv <- ivreg(Y ~ D | Z, data = dat_iv)              # TSLS equals Wald here
+rbind(true_beta = beta_true, wald, reduced_form_ratio = rf_ratio, iv_tsls = coef(fit_iv)["D"])
+```
+
+**Plots:** (i) naive `Y~D` vs (ii) `Y~D̂` (first‑stage fitted).
+```{r iv-plots}
+fs <- lm(D ~ Z, data = dat_iv); dat_iv$Dhat <- fitted(fs)  # <-- first stage
+p1 <- ggplot(dat_iv, aes(D, Y)) +
+  geom_point(alpha=.15) + geom_smooth(method="lm", se=FALSE) +
+  labs(title="Naive OLS: Y vs D (biased)", x="D", y="Y")
+p2 <- ggplot(dat_iv, aes(Dhat, Y)) +
+  geom_point(alpha=.15) + geom_smooth(method="lm", se=FALSE) +
+  labs(title="TSLS intuition: Y vs D̂", x=expression(hat(D)), y="Y")
+p1; p2
+```
+
+**Plots:** Reduced forms (means by Z).
+```{r iv-rf-plots}
+means <- dat_iv %>% group_by(Z) %>% summarise(Ybar=mean(Y), Dbar=mean(D))
+pY <- ggplot(means, aes(factor(Z), Ybar)) +
+  geom_col(width=.55) + geom_text(aes(label=round(Ybar,2)), vjust=-0.3) +
+  labs(title="Reduced form: E[Y|Z]", x="Z", y="Mean Y")
+pD <- ggplot(means, aes(factor(Z), Dbar)) +
+  geom_col(width=.55) + geom_text(aes(label=round(Dbar,2)), vjust=-0.3) +
+  labs(title="First stage: E[D|Z]", x="Z", y="Mean D")
+pY; pD
+```
+
+## 4) Over‑identified IV (two instruments) + diagnostics
+
+```{r iv-overid}
+Z2 <- rbinom(n, 1, 0.5)
+D2 <- 0.6*Z + 0.5*Z2 + u
+Y2 <- 1 + beta_true*D2 + eps
+dat2 <- data.frame(Y=Y2, D=D2, Z1=Z, Z2=Z2)
+fit_over <- ivreg(Y ~ D | Z1 + Z2, data = dat2)
+summary(fit_over)$coef["D",, drop=FALSE]
+summary(fit_over, diagnostics = TRUE)$diagnostics   # <-- first-stage F, Wu–Hausman, Sargan (homo)
+```
+
+**First‑stage components (visual):**
+```{r iv-overid-plots}
+means_Z1 <- dat2 %>% group_by(Z1) %>% summarise(Dbar=mean(D))
+means_Z2 <- dat2 %>% group_by(Z2) %>% summarise(Dbar=mean(D))
+pZ1 <- ggplot(means_Z1, aes(factor(Z1), Dbar)) +
+  geom_col(width=.55) + geom_text(aes(label=round(Dbar,2)), vjust=-0.3) +
+  labs(title="First-stage component: E[D|Z1]", x="Z1", y="Mean D")
+pZ2 <- ggplot(means_Z2, aes(factor(Z2), Dbar)) +
+  geom_col(width=.55) + geom_text(aes(label=round(Dbar,2)), vjust=-0.3) +
+  labs(title="First-stage component: E[D|Z2]", x="Z2", y="Mean D")
+pZ1; pZ2
+```
+
+> **Note:** `summary(..., diagnostics=TRUE)` reports Sargan under homoskedasticity. For robust over‑ID tests, use GMM variants; for robust/clustered SEs, pair `ivreg` with `sandwich::vcovHC`/`vcovCL`.
+
+---
+
+# PART III — LATE & Assumptions (Potential Outcomes + Visuals)
+
+> **Slides:** LATE derivation & assumptions (pp. 23–27) and discussions (pp. 31–38). We simulate principal strata and then **violate assumptions one at a time**.
+
+## 5) Simulator with toggles (relevance, exogeneity, exclusion, monotonicity)
+
+```{r late-sim}
+inv_logit <- function(x) 1/(1+exp(-x))
+
+simulate_late <- function(n = 20000,
+                          p_c = 0.3, p_a = 0.2, p_n = NULL, p_d = 0.0,
+                          tau_c = 2.0, tau_a = 0.0, tau_n = 0.0,
+                          tau_sd = 0.4,           # heterogeneity around means
+                          exclusion = 0.0,        # direct Z->Y effect (violates exclusion if != 0)
+                          exog_k = 0.0,           # if > 0, Z depends on ability (violates exogeneity)
+                          alpha_A = 1.0,          # ability effect on Y0
+                          seed = 11) {
+  if (is.null(p_n)) p_n <- 1 - p_c - p_a - p_d      # <-- auto-balance shares
+  if (any(c(p_c, p_a, p_n, p_d) < 0)) stop("Strata shares must be nonnegative.")
+  if (abs(p_c + p_a + p_n + p_d - 1) > 1e-8) stop("Strata shares must sum to 1.")
+  set.seed(seed)
+
+  A <- rnorm(n)                                     # latent trait
+  # Instrument Z: exogenous if exog_k == 0; else P(Z=1) increases with A
+  if (exog_k == 0) {
+    Z <- rbinom(n, 1, 0.5)
+  } else {
+    pz <- inv_logit(exog_k * A)                     # <-- exogeneity violation knob
+    Z  <- rbinom(n, 1, pz)
+  }
+
+  G <- sample(c("C","A","N","D"), size=n, replace=TRUE, prob=c(p_c, p_a, p_n, p_d))
+  D0 <- as.numeric(G %in% c("A","D"))
+  D1 <- as.numeric(G %in% c("A","C"))
+  D  <- ifelse(Z==1, D1, D0)                        # realized treatment
+
+  U  <- rnorm(n)
+  Y0 <- alpha_A * A + U
+  tau_bar <- ifelse(G=="C", tau_c, ifelse(G=="A", tau_a, tau_n))
+  tau_i <- tau_bar + rnorm(n, 0, tau_sd)
+  Y1 <- Y0 + tau_i
+
+  Y  <- ifelse(D==1, Y1, Y0) + exclusion * Z        # <-- exclusion violation knob
+
+  data.frame(Y, D, Z, G, Y0, Y1, tau_i, D0, D1, A,
+             p_c=p_c, p_a=p_a, p_n=p_n, p_d=p_d, exclusion=exclusion, exog_k=exog_k)
+}
+
+summarise_late <- function(dat) {
+  ITT_y <- with(dat, mean(Y[Z==1]) - mean(Y[Z==0]))
+  ITT_d <- with(dat, mean(D[Z==1]) - mean(D[Z==0]))
+  Wald  <- ITT_y / ITT_d                                 # <-- LATE under assumptions
+  True_CATE <- with(dat, mean(Y1[G=="C"] - Y0[G=="C"]))
+  fit_iv <- ivreg(Y ~ D | Z, data = dat)
+  fs     <- lm(D ~ Z, data = dat)
+  F1     <- tryCatch(summary(fs)$fstatistic[1], error=function(e) NA_real_)
+  data.frame(ITT_y=ITT_y, ITT_d=ITT_d, Wald=Wald,
+             True_Complier_ATE=True_CATE,
+             IV_beta=coef(fit_iv)["D"],
+             IV_se_HC1=sqrt(diag(vcovHC(fit_iv, type="HC1"))["D"]),
+             FirstStage_F=as.numeric(F1))
+}
+
+plot_stage <- function(dat, title_suffix="") {
+  means <- dat %>% group_by(Z) %>% summarise(Dbar=mean(D), Ybar=mean(Y))
+  pD <- ggplot(means, aes(factor(Z), Dbar)) +
+    geom_col(width=.55) + geom_text(aes(label=sprintf("%.3f", Dbar)), vjust=-0.3) +
+    labs(title=paste0("First stage: E[D|Z] ", title_suffix), x="Z", y="Mean D")
+  pY <- ggplot(means, aes(factor(Z), Ybar)) +
+    geom_col(width=.55) + geom_text(aes(label=sprintf("%.3f", Ybar)), vjust=-0.3) +
+    labs(title=paste0("Reduced form: E[Y|Z] ", title_suffix), x="Z", y="Mean Y")
+  list(pD=pD, pY=pY)
+}
+
+plot_tau <- function(dat, title="Complier treatment effects (τ)") {
+  cate <- with(dat, mean(Y1[G=="C"] - Y0[G=="C"]))     # dashed line
+  ITTy <- with(dat, mean(Y[Z==1]) - mean(Y[Z==0]))
+  ITTd <- with(dat, mean(D[Z==1]) - mean(D[Z==0]))
+  ggplot(dat %>% filter(G=="C"), aes(tau_i)) +
+    geom_histogram(bins=30) +
+    geom_vline(xintercept=cate, linetype=2) +
+    geom_vline(xintercept=ITTy/ITTd, linetype=3) +
+    labs(title=title, subtitle="Dashed = true complier ATE; dotted = Wald ratio",
+         x=expression(tau[i]), y="Count")
+}
+```
+
+### 5A) Baseline (all assumptions hold): IV = LATE
+
+```{r late-base}
+dat0 <- simulate_late(p_d=0, exclusion=0, exog_k=0, seed=10)
+summarise_late(dat0)
+plot_stage(dat0, "(baseline)")
+plot_tau(dat0)
+```
+
+### 5B) Relevance violation (weak instrument)
+
+```{r late-relevance}
+dat_rel <- simulate_late(p_c=0.02, p_d=0, exclusion=0, exog_k=0, seed=12)  # very few compliers
+summarise_late(dat_rel)   # FirstStage_F falls; Wald unstable (denominator ≈ 0)
+plot_stage(dat_rel, "(weak instrument)")
+```
+
+### 5C) Exclusion violation (direct Z→Y)
+
+```{r late-exclusion}
+dat_exc <- simulate_late(p_d=0, exclusion=0.4, exog_k=0, seed=13)          # add direct channel
+summarise_late(dat_exc)   # Wald/IV depart from True_Complier_ATE
+plot_stage(dat_exc, "(exclusion violated)")
+```
+
+### 5D) Exogeneity violation (Z sorts on potential outcomes)
+
+```{r late-exogeneity}
+dat_exo <- simulate_late(p_d=0, exclusion=0, exog_k=1.0, alpha_A=1.0, seed=14)  # Z depends on A
+summarise_late(dat_exo)
+with(dat_exo, c(E_A_Z1 = mean(A[Z==1]), E_A_Z0 = mean(A[Z==0]), diff = mean(A[Z==1]) - mean(A[Z==0])))
+plot_stage(dat_exo, "(exogeneity violated)")
+```
+
+### 5E) Monotonicity violation (allow defiers)
+
+```{r late-monotonicity}
+dat_mon <- simulate_late(p_d=0.15, exclusion=0, exog_k=0, seed=22)         # introduce defiers
+summarise_late(dat_mon)    # Wald mixes complier & defier effects; may flip sign
+plot_stage(dat_mon, "(monotonicity violated)")
+```
+
+### 5F) Side‑by‑side comparison table
+
+```{r late-compare}
+bind_rows(
+  mutate(summarise_late(dat0),  Scenario="Baseline (all hold)"),
+  mutate(summarise_late(dat_rel), Scenario="Relevance violated"),
+  mutate(summarise_late(dat_exc), Scenario="Exclusion violated"),
+  mutate(summarise_late(dat_exo), Scenario="Exogeneity violated"),
+  mutate(summarise_late(dat_mon), Scenario="Monotonicity violated")
+) %>%
+  select(Scenario, ITT_y, ITT_d, Wald, True_Complier_ATE, IV_beta, FirstStage_F)
+```
+
+---
+
+## Closing Remarks
+
+- **From ratios to matrices:** In just‑ID settings, IV equals the **reduced‑form slope ratio** \(\hat\beta = \hat\gamma/\hat\alpha\). In over‑ID cases, TSLS equals \((X'P_ZX)^{-1}X'P_ZY\) (slides Eqs. 8–11). 
+- **When is IV a causal effect?** Under **relevance, exogeneity, exclusion, and monotonicity**, the IV coefficient with binary \(Z,D\) equals **LATE** (slides pp. 23–27). 
+- **What breaks what?** Weak instruments ⇒ instability; exclusion or exogeneity failures ⇒ **bias**; monotonicity failure (defiers) ⇒ **not** a complier ATE (ratio mixes strata). (Slides pp. 31–38.) 

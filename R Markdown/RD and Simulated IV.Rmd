@@ -1,0 +1,578 @@
+---
+title: "Modern RD practice, FRD as IV, and CG vs BH (when BH is better)"
+author: "Huan Deng"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+    code_folding: "show"
+  pdf_document:
+    latex_engine: xelatex
+    number_sections: true
+editor_options:
+  chunk_output_type: console
+---
+
+> **How this document matches your slides**  
+> - **RD & FRD**: we implement sharp RD, show why **FRD is a Wald/IV ratio**, and estimate it two ways (bias-corrected `rdrobust` and matching local 2SLS).  
+> - **Simulated IV**: we construct **Currie–Gruber (CG)** and **Borusyak–Hull (BH recentered)** instruments **with endogenous demographics**, show why raw eligibility is invalid, and compare CG vs BH (including when BH is better).  
+> - **Diagnostics**: density test (`rddensity`), covariate balance, **placebo cutoffs**, permutation distribution, and **donut RD**.  
+>
+> **Modern RD note:** High‑order global polynomials in \(X\) are discouraged. We use **local linear** fits with a **triangular kernel** and **robust bias‑corrected (RBC)** inference via `rdrobust`, mirroring current practice.
+
+---
+
+## 0) Setup
+
+**What this chunk does**
+- Sets a CRAN mirror for non‑interactive knitting; installs/loads packages.
+- Establishes plotting theme and RNG seed.  
+
+**Key functions**: `install.packages()`, `library()`, `theme_few()`.
+
+```{r setup, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Ensure CRAN mirror for non-interactive runs
+cran <- getOption("repos")
+if (is.null(cran) || is.na(cran["CRAN"]) || cran["CRAN"] == "@CRAN@") {
+  options(repos = c(CRAN = "https://cloud.r-project.org"))
+}
+
+pkgs <- c(
+  "tidyverse","rdrobust","rddensity","AER","fixest",
+  "sandwich","lmtest","modelsummary","ggthemes","purrr","patchwork"
+)
+to_install <- pkgs[!sapply(pkgs, requireNamespace, quietly = TRUE)]
+if (length(to_install)) install.packages(to_install, dependencies = TRUE, quiet = TRUE)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+theme_set(ggthemes::theme_few())
+set.seed(12345)
+```
+
+### Conventions
+- Cutoff \(c = 0\) unless noted. Running variable \(X\), treatment \(D\), outcome \(Y\); instrument \(T = \mathbb{1}\{X \ge c\}\).
+- Local estimation near \(c\), **local linear** with **triangular** kernel. RBC via `rdrobust`.
+
+---
+
+## 1) Quick theory: sharp vs fuzzy RD (FRD is IV)
+
+**What this section does**
+- Recaps SRD and FRD and shows why **FRD is a local Wald/IV ratio** at the cutoff (slides pp. 9–10).
+
+---
+
+## 2) SRD in practice (simulated data + visuals)
+
+**What the next chunk does**
+- Simulates a **sharp RD** where treatment jumps deterministically at \(c\).
+
+```{r simulate-srd}
+n  <- 4000
+x  <- rnorm(n, 0, 1)
+c0 <- 0
+dS <- as.numeric(x >= c0)  # sharp treatment
+
+# Nonlinear baseline + treatment effect
+f  <- function(z) 1 + 1.2*z + 0.4*z^2 - 0.8*abs(z)
+tau <- 3.0
+yS <- f(x) + tau*dS + rnorm(n, 0, 1)
+
+srd <- tibble(x, y = yS, d = dS)
+```
+
+**What the next chunk does**
+- Plots **binned means** with **side‑specific local linear** fits to visualize the jump at \(c\).  
+- (Fixed mapping: smooth layers use their own data/mapping to avoid ggplot inheritance errors.)
+
+```{r srd-plot, fig.height=4.2}
+binned <- srd %>%
+  mutate(bin = cut(x, breaks = seq(min(x), max(x), length.out = 60))) %>%
+  group_by(bin) %>%
+  summarize(xbar = mean(x), ybar = mean(y), .groups = "drop")
+
+left  <- dplyr::filter(srd, x <  c0)
+right <- dplyr::filter(srd, x >= c0)
+
+p_srd <- ggplot(binned, aes(xbar, ybar)) +
+  geom_point() +
+  geom_smooth(data = left,  mapping = aes(x = x, y = y), method = "lm", formula = y ~ x, se = FALSE, inherit.aes = FALSE) +
+  geom_smooth(data = right, mapping = aes(x = x, y = y), method = "lm", formula = y ~ x, se = FALSE, inherit.aes = FALSE) +
+  geom_vline(xintercept = c0, linetype = 2) +
+  labs(title = "SRD: binned means + side-specific local linear fits", x = "Running variable X", y = "Outcome Y")
+p_srd
+```
+
+**What the next chunk does**
+- Estimates the SRD effect using `rdrobust(y, x, c=)` with **RBC**.
+- Runs the **`rddensity`** manipulation test and draws the McCrary plot.
+
+**Key functions**: `rdrobust()`, `rddensity()`, `rdplotdensity()`.
+
+```{r srd-estimate-and-density, fig.height=3.5}
+est_srd <- rdrobust(yS, x, c = c0, kernel = "triangular", p = 1, q = 2)  # local linear + RBC
+summary(est_srd)
+
+dens <- rddensity(x, c = c0)
+summary(dens)
+rdplotdensity(dens, x)
+```
+
+---
+
+## 3) FRD in practice (and why it’s IV)
+
+**What the next chunk does**
+- Simulates a **fuzzy RD** where `Pr(D=1|X)` increases discontinuously at \(c\).
+
+```{r simulate-frd}
+# Probability of treatment jumps by ~0.6 at the cutoff
+p  <- plogis(-0.8 + 1.6*(x >= c0) + 0.6*x)
+dF <- rbinom(n, 1, p)
+tauF <- 3.0
+yF <- f(x) + tauF*dF + rnorm(n)
+
+frd <- tibble(x, d = dF, y = yF, T = as.numeric(x >= c0))
+```
+
+**What the next chunk does**
+- Visualizes the **reduced form** (Y vs X) and the **first stage** (Pr[D=1] vs X) using binned means.
+
+```{r frd-rdplots, fig.height=4.4}
+p_rf <- frd %>%
+  mutate(bin = cut(x, breaks = seq(min(x), max(x), length.out = 60))) %>%
+  group_by(bin) %>% summarize(xbar = mean(x), ybar = mean(y), .groups = "drop") %>%
+  ggplot(aes(xbar, ybar)) + geom_point() + geom_vline(xintercept = c0, linetype = 2) +
+  labs(title = "Reduced form: Y vs X (binned means)", x = "X", y = "E[Y|X]")
+
+p_fs <- frd %>%
+  group_by(bin = cut(x, breaks = seq(min(x), max(x), length.out = 60))) %>%
+  summarize(xbar = mean(x), pD = mean(d), .groups = "drop") %>%
+  ggplot(aes(xbar, pD)) + geom_point() + geom_vline(xintercept = c0, linetype = 2) +
+  labs(title = "First stage: Pr(D=1) vs X (binned means)", x = "X", y = "Pr(D=1)")
+
+p_rf + p_fs
+```
+
+**What the next chunk does**
+- Estimates **FRD** using `rdrobust(y, x, fuzzy=d)` with **local linear + triangular + RBC**.
+- Replicates the same estimand using **local 2SLS** with:
+  - Controls: side‑specific local linear in \(X\) (`xc` and `right:xc`).
+  - Instrument: \(T=\mathbf{1}\{X\ge c\}\).
+  - **Triangular weights** within bandwidth \(h\).
+
+**Key functions**: `rdrobust()` with `fuzzy=`, `AER::ivreg()` with `instruments=` and `weights=`.
+
+```{r frd-estimation}
+# rdrobust: local Wald (RBC)
+est_frd <- rdrobust(yF, x, fuzzy = dF, c = c0, kernel = "triangular", p = 1, q = 2)
+summary(est_frd)
+
+# local 2SLS with triangular weights
+h   <- 0.8
+loc <- frd %>%
+  filter(abs(x - c0) <= h) %>%
+  mutate(xc = x - c0,
+         right = as.numeric(xc >= 0),
+         T = as.numeric(x >= c0),
+         w = pmax(0, 1 - abs(xc)/h))    # triangular kernel weights
+
+iv_form   <- y ~ d + xc + right:xc
+inst_form <- ~ T + xc + right:xc
+
+iv_loc <- AER::ivreg(iv_form, instruments = inst_form, data = loc, weights = w)
+Vcl    <- sandwich::vcovCL(iv_loc, cluster = loc$T)
+tau_hat <- coef(iv_loc)["d"]
+lmtest::coeftest(iv_loc, vcov = Vcl)
+```
+
+**What the next chunk does**
+- Shows **bandwidth sensitivity** for the FRD effect using the **local 2SLS** estimator.
+
+```{r frd-sensitivity, fig.height=4.2}
+try_h <- seq(0.3, 1.2, by = 0.1)
+
+get_tau_rd <- function(h){
+  est <- rdrobust(yF, x, fuzzy = dF, c = c0, kernel = "triangular", p = 1, q = 2, h = h)
+  c(h = h, tau = est$coef[1])
+}
+
+get_tau_2sls <- function(h){
+  loc <- frd %>% filter(abs(x - c0) <= h) %>%
+    mutate(xc = x - c0, right = as.numeric(xc >= 0), T = as.numeric(x >= c0), w = pmax(0, 1 - abs(xc)/h))
+  fit <- AER::ivreg(y ~ d + xc + right:xc, instruments = ~ T + xc + right:xc, data = loc, weights = w)
+  c(h = h, tau = coef(fit)["d"])
+}
+
+sens_rd   <- purrr::map_dfr(try_h, get_tau_rd)
+sens_iv   <- purrr::map_dfr(try_h, get_tau_2sls)
+p1 <- ggplot(sens_rd, aes(h, tau)) + geom_line() + geom_point() +
+  labs(title = "FRD via rdrobust (RBC): bandwidth sensitivity", x = "Bandwidth h", y = "Estimate")
+
+p2 <- ggplot(sens_iv, aes(h, tau)) + geom_line() + geom_point() +
+  labs(title = "FRD via local 2SLS (triangular weights)", x = "Bandwidth h", y = "Estimate")
+
+p1 + p2
+```
+
+### 3.5 Placebo cutoffs, permutation, and donut RD
+
+**What the next three chunks do**
+- **Placebo cutoffs:** Re-estimate local 2SLS at many fake cutoffs $c^{*} \neq c$; only the true cutoff should "jump".
+- **Permutation distribution:** Histogram of placebo estimates from random fake cutoffs; the real estimate should stand out.  
+- **Donut RD:** Exclude observations near $c$ and re‑estimate to see if results hinge on the most manipulable region.
+
+```{r frd-placebos, fig.height=4.8, message=FALSE}
+local_iv_at <- function(dat, c, h=0.8){
+  loc <- dat %>% filter(abs(x - c) <= h) %>%
+    mutate(xc = x - c, right = as.numeric(xc >= 0), T = as.numeric(x >= c), w = pmax(0, 1 - abs(xc)/h))
+  if (nrow(loc) < 80) return(tibble(cutoff = c, tau = NA_real_, se = NA_real_))
+  fit <- AER::ivreg(y ~ d + xc + right:xc, instruments = ~ T + xc + right:xc, data = loc, weights = w)
+  V   <- sandwich::vcovCL(fit, cluster = loc$T)
+  tibble(cutoff = c, tau = coef(fit)["d"], se = sqrt(V["d","d"]))
+}
+
+grid <- seq(min(frd$x), max(frd$x), length.out = 45)
+grid <- grid[abs(grid - c0) > 0.15]  # drop the true cutoff neighborhood
+placebos <- purrr::map_dfr(grid, ~ local_iv_at(frd, c = .x, h = 0.8)) %>% tidyr::drop_na()
+placebos <- placebos %>% mutate(lo = tau - 1.96*se, hi = tau + 1.96*se)
+
+ggplot(placebos, aes(cutoff, tau)) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_ribbon(aes(ymin = lo, ymax = hi), alpha = .15) +
+  geom_line() + geom_point() +
+  geom_vline(xintercept = c0, color = "red", linetype = 2) +
+  labs(title = "Placebo cutoffs (local 2SLS, local linear + triangular)", x = "Fake cutoff c*", y = "Estimated effect")
+```
+
+```{r frd-permutation, fig.height=3.8}
+set.seed(123)
+rand_c <- runif(200, min(frd$x), max(frd$x))
+perm <- purrr::map_dfr(rand_c, ~ local_iv_at(frd, c = .x, h = 0.8)) %>% tidyr::drop_na()
+ggplot(perm, aes(tau)) +
+  geom_histogram(bins = 30) +
+  geom_vline(xintercept = tau_hat, color = "red", linetype = 2) +
+  labs(title = "Distribution of placebo estimates", x = "Estimated tau at random cutoffs", y = "Count")
+```
+
+```{r frd-donut, fig.height=4.2}
+try_r0 <- seq(0, 0.25, by = 0.02)
+get_tau_donut <- function(r0){
+  loc <- frd %>% filter(abs(x - c0) <= 0.8, abs(x - c0) > r0) %>%
+    mutate(xc = x - c0, right = as.numeric(xc >= 0), T = as.numeric(x >= c0), w = pmax(0, 1 - abs(xc)/0.8))
+  fit <- AER::ivreg(y ~ d + xc + right:xc, instruments = ~ T + xc + right:xc, data = loc, weights = w)
+  coef(fit)["d"]
+}
+donut <- tibble(r0 = try_r0, tau = purrr::map_dbl(try_r0, get_tau_donut))
+ggplot(donut, aes(r0, tau)) + geom_line() + geom_point() +
+  geom_hline(yintercept = tau_hat, linetype = 2) +
+  labs(title = "Donut FRD: excluding data near the cutoff", x = "Donut radius r0", y = "2SLS estimate of tau")
+```
+
+---
+
+## 4) Simulated instruments **with endogenous demographics**
+
+**Why endogeneity?**  
+Eligibility $Z_i=f(g_{s(i)}, w_i)$ depends on **policy** $g_s$ and **demographics** $w_i$. If $w_i$ correlates with the outcome error $\varepsilon_i$, then raw eligibility $Z_i$ is **not** a valid IV. We therefore construct **CG** and **BH** instruments that remove the $w$ channel.
+
+### 4.1 Data‑generating process with **endogenous** demographics
+
+**What this chunk does**
+- Introduces an unobserved factor $u_i$ that affects **demographics** and the **outcome error**, making $w_i$ endogenous.  
+- Constructs states’ policies $g_s$, eligibility $Z_i$, take‑up $X_i$, and outcome $Y_i$.
+
+```{r simiv-data-endo}
+# States & policies
+S <- 40
+N <- 500 * S
+policy <- tibble(state = 1:S, theta = rnorm(S, mean = 0, sd = 0.6))
+
+# Unobserved factor that drives both demographics and outcome shocks
+u <- rnorm(N)
+
+# Endogenous demographics (depend on u)
+income <- 0.6*u + rnorm(N)                       # true income
+kids   <- rbinom(N, 1, plogis(-0.3 - 0.6*u))     # families with lower u more likely to have kids
+
+# Eligibility rule: eligible if income <= theta_s - 0.4*kids
+f_elig <- function(theta, income, kids) as.numeric(income <= theta - 0.4*kids)
+
+# Assemble data
+df <- tibble(
+  id = 1:N,
+  state = rep(1:S, each = N / S),
+  theta = policy$theta[match(rep(1:S, each = N / S), policy$state)],
+  u = u,
+  income = income,
+  kids = kids
+)
+
+df <- df %>% mutate(
+  Z = f_elig(theta, income, kids),                               # raw eligibility (INVALID IV)
+  X = rbinom(N, 1, plogis(-0.8 + 1.8*Z + 0.2*income + 0.3*u)),   # take-up: affected by Z and u
+  eps = 0.6*u + rnorm(N),                                        # outcome error correlated with u
+  beta = 1.2,
+  Y = beta*X + 0.4*income + eps                                  # structural outcome
+)
+```
+
+### 4.2 Build **CG** and **BH recentered** instruments
+
+**What this chunk does**
+- Builds $Z^{CG}$ by integrating out demographics using a **fixed national sample** $W^*$.  
+- Builds $\tilde z_i = Z_i - \mu_i$ with $\mu_i = \mathbb{E}_g[f(g,w_i)]$ by averaging over the **policy distribution**.
+
+```{r simiv-iv-build}
+# CG instrument (randomize individuals using a fixed national sample W*)
+Wstar <- tibble(income = rnorm(15000, 0, 1), kids = rbinom(15000, 1, 0.5))
+cg_by_state <- policy %>%
+  rowwise() %>%
+  mutate(Z_CG = mean(f_elig(theta, Wstar$income, Wstar$kids))) %>%
+  ungroup()
+df <- df %>% left_join(cg_by_state %>% select(state, Z_CG), by = "state")
+
+# BH recentered (randomize policies)
+mu_i <- sapply(1:nrow(df), function(i){
+  mean(f_elig(policy$theta, df$income[i], df$kids[i]))
+})
+df$z_tilde <- df$Z - mu_i
+```
+
+### 4.3 Sanity check: **Invalid raw Z**, valid CG/BH
+
+**What this chunk does**
+- Computes correlations with the **true structural error** `eps`.  
+- Shows raw `Z` is correlated with the error (invalid), while `Z_CG` and `z_tilde` are not.
+
+```{r simiv-corr-check}
+with(df, c(
+  cor_Z_eps   = cor(Z, eps),
+  cor_CG_eps  = cor(Z_CG, eps),
+  cor_BH_eps  = cor(z_tilde, eps)
+))
+```
+
+### 4.4 First stage (no demographic controls)
+
+**What this chunk does**
+- Estimates first stages without controlling for demographics (to preserve endogeneity of raw Z).  
+- CG varies at **state** level; BH varies **within state** (we include state FE for BH).
+
+```{r simiv-firststage}
+fs_rawZ <- lm(X ~ Z, data = df)
+fs_cg   <- lm(X ~ Z_CG, data = df)
+fs_bh   <- lm(X ~ z_tilde + factor(state), data = df)
+
+modelsummary::msummary(
+  list("Raw eligibility Z (invalid IV)" = fs_rawZ,
+       "CG simulated IV" = fs_cg,
+       "BH recentered IV (+ state FE)" = fs_bh),
+  coef_omit = "(^factor\\(state\\)|^\\(Intercept\\)$)",
+  gof_omit = "IC|Adj|Within|Pseudo|Log|AIC|BIC",
+  statistic = "({std.error})"
+)
+```
+
+### 4.5 2SLS estimates: **invalid Z** vs **CG/BH**
+
+**What this chunk does**
+- Compares 2SLS using **raw Z** (invalid), **CG** (valid), and **BH** (valid).  
+- Clusters SEs by state; true effect is $beta = 1.2$.
+
+```{r simiv-2sls}
+# Naive/invalid IV: uses raw eligibility (endogenous through w)
+iv_Z  <- AER::ivreg(Y ~ X | Z, data = df)
+V_Z   <- sandwich::vcovCL(iv_Z, cluster = ~ state)
+
+# CG 2SLS: valid (depends only on policy g_s)
+iv_CG <- AER::ivreg(Y ~ X | Z_CG, data = df)
+V_CG  <- sandwich::vcovCL(iv_CG, cluster = ~ state)
+
+# BH 2SLS: valid (can include state FE because z_tilde varies within state)
+iv_BH <- AER::ivreg(Y ~ X + factor(state) | z_tilde + factor(state), data = df)
+V_BH  <- sandwich::vcovCL(iv_BH, cluster = ~ state)
+
+lmtest::coeftest(iv_Z,  vcov = V_Z)
+lmtest::coeftest(iv_CG, vcov = V_CG)
+lmtest::coeftest(iv_BH, vcov = V_BH)
+```
+
+**What the next chunk does**
+- Presents all estimates side‑by‑side and shows weak‑IV diagnostics.
+
+```{r simiv-compare}
+modelsummary::modelsummary(
+  list("Naive IV with raw Z (invalid)" = iv_Z,
+       "CG simulated IV (valid)" = iv_CG,
+       "BH recentered IV (valid)" = iv_BH),
+  vcov = list(V_Z, V_CG, V_BH),
+  coef_map = c("(Intercept)"="Intercept","X"="Treatment (X)"),
+  coef_omit = "(^factor\\(state\\)|^\\(Intercept\\)$)",
+  gof_omit = "IC|Adj|Within|Pseudo|Log|AIC|BIC"
+)
+
+summary(iv_Z, diagnostics = TRUE)
+summary(iv_CG, diagnostics = TRUE)
+summary(iv_BH, diagnostics = TRUE)
+```
+
+---
+
+## 4B) CG vs BH - When is BH better?
+
+**What this section does**  
+- Compares **CG** vs **BH recentered** by varying **policy dispersion** and measuring the **share of infra‑marginal individuals**.  
+- Shows BH is typically stronger/more efficient when the infra‑marginal share is high or when including **state FE**.
+
+> **Key ideas to watch in the plots**
+> 1) **Infra‑marginal share** up ⇒ **BH first stage** up relative to CG (CG diluted at state level).  
+> 2) **State fixed effects**: BH varies **within** state; CG cannot be used with FE.  
+> 3) With many infra‑marginals (low dispersion), BH yields **lower RMSE** for the treatment effect.
+
+```{r bh-better-functions, message=FALSE, warning=FALSE}
+sim_once <- function(S=40, N_per=250, sd_theta=0.6, sigma_income=1.0,
+                     beta=1.2, u2y=0.6){
+  set.seed(NULL)
+  # Policies and data
+  policy <- tibble(state = 1:S, theta = rnorm(S, 0, sd_theta))
+  N <- S * N_per
+  u <- rnorm(N)
+  income <- 0.6*u + rnorm(N, sd = sigma_income)
+  kids <- rbinom(N, 1, plogis(-0.3 - 0.6*u))
+  state <- rep(1:S, each = N_per)
+  theta_i <- policy$theta[state]
+  f_elig <- function(theta, income, kids) as.numeric(income <= theta - 0.4*kids)
+  Z <- f_elig(theta_i, income, kids)
+  X <- rbinom(N, 1, plogis(-0.8 + 1.8*Z + 0.2*income + 0.3*u))
+  eps <- u2y*u + rnorm(N)
+  Y <- beta*X + 0.4*income + eps
+
+  # CG instrument (state-level only)
+  Wstar <- tibble(income = rnorm(12000, 0, 1),
+                  kids   = rbinom(12000, 1, 0.5))
+  cg_by_state <- policy %>%
+    rowwise() %>%
+    mutate(Z_CG = mean(f_elig(theta, Wstar$income, Wstar$kids))) %>%
+    ungroup()
+  Z_CG <- cg_by_state$Z_CG[state]
+
+  # BH recentered instrument (varies within state)
+  mu_i <- sapply(1:length(income), function(i){
+    mean(f_elig(policy$theta, income[i], kids[i]))
+  })
+  z_tilde <- Z - mu_i
+
+  # Share infra-marginal (eligibility invariant across states)
+  infra_share <- mean(mu_i %in% c(0,1))
+
+  # First-stage partial F: CG (no FE), BH (+ state FE)
+  f_full  <- lm(X ~ Z_CG + income + kids)
+  f_rest  <- lm(X ~ income + kids)
+  RSS1 <- sum(resid(f_rest)^2); RSS2 <- sum(resid(f_full)^2)
+  n <- length(X); p <- 1; k2 <- length(coef(f_full))
+  F_CG <- ((RSS1 - RSS2)/p) / (RSS2/(n - k2))
+
+  f_full_bh <- lm(X ~ z_tilde + income + kids + factor(state))
+  f_rest_bh <- lm(X ~ income + kids + factor(state))
+  RSS1b <- sum(resid(f_rest_bh)^2); RSS2b <- sum(resid(f_full_bh)^2)
+  k2b <- length(coef(f_full_bh))
+  F_BH <- ((RSS1b - RSS2b)/p) / (RSS2b/(n - k2b))
+
+  # 2SLS
+  iv_CG <- AER::ivreg(Y ~ X + income + kids | Z_CG + income + kids)
+  iv_BH <- AER::ivreg(Y ~ X + income + kids + factor(state) |
+                        z_tilde + income + kids + factor(state))
+  bh <- coef(iv_BH)["X"]; cg <- coef(iv_CG)["X"]
+
+  tibble(sd_theta = sd_theta, sigma_income = sigma_income,
+         infra_share = infra_share, F_CG = F_CG, F_BH = F_BH,
+         err_CG = (cg - beta)^2, err_BH = (bh - beta)^2)
+}
+```
+
+**What the next chunk does**  
+- Runs the small Monte Carlo across a grid of **policy dispersion**.  
+- Stacks the three plots **vertically** for a clean look.  
+- Uses **ASCII labels** to avoid Unicode PDF issues.
+
+```{r bh-better-sim, message=FALSE, warning=FALSE, echo=FALSE, fig.width=7, fig.height=12}
+set.seed(123)
+grid_sd <- seq(0.2, 1.2, by = 0.2)
+M <- 100   # increase for smoother curves if needed
+
+res <- purrr::map_dfr(grid_sd, function(sdt){
+  purrr::map_dfr(1:M, ~ sim_once(sd_theta = sdt))
+})
+
+summary_tab <- res %>%
+  group_by(sd_theta) %>%
+  summarize(F_CG = mean(F_CG), F_BH = mean(F_BH),
+            RMSE_CG = sqrt(mean(err_CG)), RMSE_BH = sqrt(mean(err_BH)),
+            infra_share = mean(infra_share), .groups = "drop")
+
+# (i) First-stage strength
+pF <- ggplot(summary_tab, aes(sd_theta, F_CG)) +
+  geom_line() + geom_point() +
+  geom_line(aes(y = F_BH), linetype = 2) +
+  labs(title = "First-stage partial F: CG (solid) vs BH (dashed)",
+       x = "Policy dispersion (sd of thresholds)", y = "Partial F")
+
+# (ii) Estimator precision (ASCII labels to avoid Unicode in PDF)
+pV <- ggplot(summary_tab, aes(sd_theta, RMSE_CG)) +
+  geom_line() + geom_point() +
+  geom_line(aes(y = RMSE_BH), linetype = 2) +
+  labs(title = "RMSE of 2SLS for beta: CG (solid) vs BH (dashed)",
+       x = "Policy dispersion (sd of thresholds)", y = "RMSE(beta_hat)")
+
+# (iii) Infra-marginal share (BH advantage grows as this rises)
+pI <- ggplot(summary_tab, aes(sd_theta, infra_share)) +
+  geom_line() + geom_point() +
+  labs(title = "Share with eligibility invariant across states",
+       x = "Policy dispersion", y = "Share of infra-marginals")
+
+# Stack vertically
+(pF / pV / pI) + patchwork::plot_layout(ncol = 1, heights = c(1, 1, 1))
+```
+
+---
+
+## 5) Diagnostics & good practice checklist (with visuals)
+
+**What the next chunk does**
+- Builds a **placebo covariate** that should be smooth at the cutoff and checks balance using `rdrobust`.  
+- Also shows a binscatter balance plot.
+
+```{r balance-check, fig.height=3.8}
+frd$w <- 0.2*frd$x + rnorm(n)
+p_bal <- frd %>%
+  group_by(bin = cut(x, breaks = seq(min(x), max(x), length.out = 60))) %>%
+  summarize(xbar = mean(x), wbar = mean(w), .groups = "drop") %>%
+  ggplot(aes(xbar, wbar)) + geom_point() + geom_vline(xintercept = c0, linetype = 2) +
+  labs(title = "Covariate balance at the cutoff (placebo outcome)", x = "X", y = "E[w|X]")
+print(p_bal)
+
+est_bal <- rdrobust(frd$w, frd$x, c = c0, kernel = "triangular", p = 1, q = 2)
+summary(est_bal)
+```
+
+---
+
+## Appendix: helper utility (local IV, local linear + triangular)
+
+```{r helpers}
+local_iv <- function(dat, c = 0, h = 0.8){
+  stopifnot(all(c("y","d","x") %in% names(dat)))
+  loc <- dat %>% filter(abs(x - c) <= h) %>%
+    mutate(xc = x - c, right = as.numeric(xc >= 0), T = as.numeric(x >= c), w = pmax(0, 1 - abs(xc)/h))
+  fit <- AER::ivreg(y ~ d + xc + right:xc, instruments = ~ T + xc + right:xc, data = loc, weights = w)
+  fit
+}
+
+sessionInfo()
+```

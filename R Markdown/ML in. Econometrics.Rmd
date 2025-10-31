@@ -1,0 +1,801 @@
+---
+title: "Machine Learning in Econometrics"
+author: "Huan Deng"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    df_print: paged
+---
+
+> **How to use this file.** Each section begins with a short explanation (what/why), followed by an R chunk (how). All data are simulated, so it runs anywhere; packages auto-install if missing.
+
+# Basic Set-up
+
+Load necessary packages
+
+```{r setup, include=FALSE}
+# Global chunk options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5)
+set.seed(123)
+
+# Helper to install & load packages students may not have
+ensure_packages <- function(pkgs) {
+  to_install <- pkgs[!(pkgs %in% rownames(installed.packages()))]
+  if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+  invisible(lapply(pkgs, require, character.only = TRUE))
+}
+
+ensure_packages(c(
+  "tidyverse",     # wrangling/plots
+  "glmnet",        # LASSO / Ridge / Elastic Net
+  "ranger",        # fast Random Forests
+  "grf",           # generalized / causal forests
+  "DoubleML",      # DML estimators
+  "mlr3", "mlr3learners",
+  "data.table",
+  "broom", "patchwork",
+  "cluster",       # silhouette for clustering
+  "kableExtra",# tables
+  "recipes",
+  "e1071",
+  "purrr","tidyr"
+))
+
+theme_set(ggplot2::theme_minimal())
+options(dplyr.summarise.inform = FALSE)
+
+```
+
+# Showing Overfitting
+
+We expand `x1…x5` to a high-capacity basis (raw polynomials + pairwise interactions). Naïve OLS on this basis usually overfits: very low training error but worse test error or numerical instability. Cross-validated lasso on the **same** basis shrinks/zeros many coefficients, improving test RMSE and producing a more interpretable model.
+
+
+```{r}
+# ---- overfit_degree_sweep_OLS_only: continuous MSE vs degree + clean raw-data panel ----
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(patchwork)
+
+# 1) Create 1-D toy data (if not present)
+if (!exists("train_1d") || !exists("test_1d")) {
+  set.seed(42)
+  n  <- 1000
+  x  <- runif(n, -1, 1)
+  f  <- function(x) sin(2*pi*x)
+  y  <- f(x) + rnorm(n, sd = 0.25)  # modest noise so overfitting is visible
+  ix <- sample.int(n, floor(0.75*n))
+  train_1d <- data.frame(x = x[ix],  y = y[ix],  split = "Train")
+  test_1d  <- data.frame(x = x[-ix], y = y[-ix], split = "Test")
+}
+
+# 2) Fit OLS for degrees 1..Dmax using the same formula for predict()
+Dmax <- 40
+deg_seq <- 1:Dmax
+
+fit_ols_deg <- function(d) {
+  form <- as.formula(paste0("y ~ poly(x, ", d, ", raw = TRUE)"))
+  fit  <- lm(form, data = train_1d)
+  c(
+    rmse_tr = sqrt(mean((train_1d$y - predict(fit, newdata = train_1d))^2)),
+    rmse_te = sqrt(mean((test_1d$y  - predict(fit, newdata = test_1d ))^2))
+  )
+}
+
+rmse_mat <- sapply(deg_seq, fit_ols_deg)
+rmse_df  <- tibble(
+  degree     = deg_seq,
+  Train_RMSE = rmse_mat["rmse_tr", ],
+  Test_RMSE  = rmse_mat["rmse_te", ]
+)
+
+# Pick best degree by minimum Test RMSE (for illustration)
+best_idx <- which.min(rmse_df$Test_RMSE)
+d_star   <- rmse_df$degree[best_idx]
+d_hi     <- max(deg_seq)    # very high degree to show overfitting (e.g., 40)
+
+# 3) Build fitted curves for a few selected degrees (1, d*, very high)
+xg  <- seq(-1, 1, length.out = 400)
+f_true <- sin(2*pi*xg)
+
+ols_fit <- function(d) lm(as.formula(paste0("y ~ poly(x, ", d, ", raw = TRUE)")), data = train_1d)
+
+fit1   <- ols_fit(1)
+fitds  <- ols_fit(d_star)
+fithi  <- ols_fit(d_hi)
+
+curves <- tibble(
+  x      = xg,
+  Deg1   = predict(fit1,  newdata = data.frame(x = xg)),
+  DegStar= predict(fitds, newdata = data.frame(x = xg)),
+  DegHi  = predict(fithi, newdata = data.frame(x = xg))
+) |>
+  pivot_longer(-x, names_to = "Model", values_to = "yhat")
+
+# 4) Panel A: Continuous RMSE vs degree (train & test) with minimum highlighted
+panelA <- rmse_df |>
+  pivot_longer(c(Train_RMSE, Test_RMSE), names_to = "Split", values_to = "RMSE") |>
+  ggplot(aes(degree, RMSE, color = Split)) +
+  geom_line(linewidth = 1) +
+  geom_point(size = 1.5, alpha = 0.8) +
+  geom_vline(xintercept = d_star, linetype = 2, color = "#F58518") +
+  annotate("label", x = d_star, y = min(rmse_df$Test_RMSE),
+           label = paste0("min Test RMSE at d = ", d_star),
+           vjust = -1.1, fill = "white", color = "#F58518", label.size = 0.2) +
+  labs(title = "Train vs Test RMSE across polynomial degree",
+       subtitle = "Train error falls with degree; Test error bottoms out then rises (overfitting)",
+       x = "Polynomial degree", y = "RMSE (lower is better)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+# 5) Panel B: Clean raw-data plot + true curve + selected fitted curves
+#    Keep y-axis within a sensible range so wiggles are visible without huge spikes.
+y_range <- range(c(train_1d$y, test_1d$y, f_true))
+y_pad   <- diff(y_range) * 0.25
+ylim_use <- c(y_range[1] - y_pad, y_range[2] + y_pad)
+
+# ---- Panel B (refined colors & styling) ----
+# ---- Panel B (simple colors: blue/orange/red) ----
+panelB <- ggplot() +
+  # raw points (keep them neutral so curves pop)
+  geom_point(aes(x, y), data = train_1d,
+             color = "grey75", alpha = 0.7, size = 1.8) +
+  geom_point(aes(x, y), data = test_1d,
+             color = "grey30", alpha = 0.9, size = 2.2) +
+  # true function
+  geom_line(aes(xg, f_true), color = "black", linewidth = 1.1, alpha = 0.9) +
+  # fitted curves: Deg1 (blue), DegStar (orange), DegHi (red)
+  geom_line(
+    aes(x, yhat, color = Model, linetype = Model),
+    data = curves |> dplyr::filter(Model %in% c("Deg1","DegStar","DegHi")),
+    linewidth = 1.2
+  ) +
+  scale_color_manual(
+    values = c(
+      Deg1    = "blue",    # low degree
+      DegStar = "orange",  # best test degree
+      DegHi   = "red"      # very high degree (overfitting)
+    ),
+    labels = c(
+      Deg1    = "Degree 1 (low)",
+      DegStar = paste0("Degree ", d_star, " (best Test)"),
+      DegHi   = paste0("Degree ", d_hi, " (very high)")
+    )
+  ) +
+  scale_linetype_manual(
+    values = c(Deg1 = "solid", DegStar = "solid", DegHi = "dashed"),
+    labels = c(
+      Deg1    = "Degree 1 (low)",
+      DegStar = paste0("Degree ", d_star, " (best Test)"),
+      DegHi   = paste0("Degree ", d_hi, " (very high)")
+    )
+  ) +
+  coord_cartesian(ylim = ylim_use) +
+  labs(
+    title    = "Raw data and fitted OLS curves",
+    subtitle = "True f(x) in black. Very-high degree oscillates and chases noise.",
+    x = "x", y = "y", color = "Curve", linetype = "Curve"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(size = 11),
+    legend.text  = element_text(size = 10)
+  )
+# 6) Combine panels
+panelA
+panelB 
+
+
+```
+
+
+# Simulating Data
+
+We simulate one re-usable dataset: covariates `X`, a *confounded* treatment `w` with propensity `e(X)`, a nonlinear baseline outcome `μ0(X)`, and heterogeneous treatment effects `τ(X)`. We also create train/test splits and `model.matrix` inputs (for glmnet) so every later section can share the same data-generating story.
+
+
+
+```{r}
+n  <- 3000
+p  <- 10
+X  <- matrix(rnorm(n * p), n, p)
+colnames(X) <- paste0("x", 1:p)
+Xdf <- as_tibble(X)
+
+tau_fun <- function(x) 1 + 1.25 * (x[,1] > 0) + 0.5 * x[,2]              # τ(x)
+mu0_fun <- function(x) 2*x[,1] + 0.5*x[,2]^2 - x[,3] + 0.5*x[,4]*x[,5]  # μ0(x)
+logit   <- function(z) 1/(1+exp(-z))
+e_fun   <- function(x) logit(-0.3 + 0.6*x[,1] - 0.4*x[,2] + 0.2*x[,3])  # P(W=1|X)
+
+tau_true <- tau_fun(X)
+mu0_true <- mu0_fun(X)
+e_true   <- e_fun(X)
+
+true_ATE_sim <- mean(tau_true)
+
+W   <- rbinom(n, 1, e_true)     # confounded treatment
+eps <- rnorm(n, 1, 1)
+Y   <- mu0_true + tau_true * W + eps
+
+data <- bind_cols(tibble(y = Y, w = W), Xdf)
+
+# Train/test split for predictive sections
+
+set.seed(123)
+idx_train <- sample.int(n, size = floor(0.7*n))
+train <- data[idx_train, ]
+test  <- data[-idx_train, ]
+
+# Model matrices for glmnet
+
+X_train <- model.matrix(y ~ . , data = train)[, -1]
+y_train <- train$y
+X_test  <- model.matrix(y ~ . , data = test)[, -1]
+y_test  <- test$y
+
+tibble(
+  True_ATE_sim = true_ATE_sim
+)
+```
+
+
+# Ridge and Lasso
+
+Cross-validated ridge (`α=0`) and lasso (`α=1`) are trained on the main dataset. We report test RMSE to contrast *dense* shrinkage (ridge) with *sparse* shrinkage (lasso). Use this to discuss when each is preferable (multicollinearity vs. variable selection).
+
+
+```{r}
+cv_ridge <- cv.glmnet(X_train, y_train, alpha = 0, nfolds = 10, standardize = TRUE)
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1, nfolds = 10, standardize = TRUE)
+
+pred_ridge <- as.numeric(predict(cv_ridge, newx = X_test, s = "lambda.min"))
+pred_lasso <- as.numeric(predict(cv_lasso, newx = X_test, s = "lambda.min"))
+
+rmse_ridge <- sqrt(mean((y_test - pred_ridge)^2))
+rmse_lasso <- sqrt(mean((y_test - pred_lasso)^2))
+
+kableExtra::kable(tibble(Model = c("Ridge (λ_min)", "LASSO (λ_min)"),
+Test_RMSE = c(rmse_ridge, rmse_lasso)), digits = 4)
+
+nz_ridge <- sum(coef(cv_ridge, s = "lambda.min") != 0) - 1
+nz_lasso <- sum(coef(cv_lasso, s = "lambda.min") != 0) - 1
+
+tibble(Method = c("Ridge","LASSO"),
+Nonzero_Coefficients = c(nz_ridge, nz_lasso))
+
+```
+
+
+# SVM
+
+On a simple 2-D problem, we plot linear vs. RBF-kernel SVMs: decision boundary \(f(x)=0\), margins \(f(x)=\pm1\), and support vectors. The RBF kernel implements a distance-based similarity, enabling nonlinear separation; tune \((C,\gamma)\) by CV.
+
+
+
+```{r}
+# ---- svm_demo_plots: linear vs RBF SVM with decision boundary/margins ----
+library(e1071)
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+
+set.seed(123)
+
+# 1) Make a 2-D toy dataset with two partly overlapping blobs
+n   <- 120
+mu1 <- c(-1.0, -1.0)
+mu2 <- c( 1.3,  1.1)
+Sigma <- matrix(c(1, 0.25, 0.25, 1), 2, 2)
+gen <- function(mu, n) {
+  Z <- matrix(rnorm(2*n), 2, n)
+  t(matrix(mu, nrow = 2, ncol = n) + chol(Sigma) %*% Z)
+}
+A <- gen(mu1, n); B <- gen(mu2, n)
+df <- bind_rows(
+  tibble(x1 = A[,1], x2 = A[,2], y = factor(-1, levels = c(-1, 1))),
+  tibble(x1 = B[,1], x2 = B[,2], y = factor( 1, levels = c(-1, 1)))
+)
+
+# Utility to make a dense grid around the data
+make_grid <- function(dat, padding = 0.8, len = 300) {
+  xr <- range(dat$x1); yr <- range(dat$x2)
+  xs <- seq(xr[1] - padding, xr[2] + padding, length.out = len)
+  ys <- seq(yr[1] - padding, yr[2] + padding, length.out = len)
+  expand.grid(x1 = xs, x2 = ys)
+}
+
+grid_xy <- make_grid(df)
+
+# 2) Fit SVMs
+svm_lin <- svm(y ~ x1 + x2, data = df,
+               kernel = "linear", cost = 1, scale = TRUE,
+               type = "C-classification")
+svm_rbf <- svm(y ~ x1 + x2, data = df,
+               kernel = "radial", gamma = 1, cost = 1, scale = TRUE,
+               type = "C-classification")
+
+# 3) Get decision values f(x) on a grid (needed for boundary/margins)
+pred_lin <- predict(svm_lin, grid_xy, decision.values = TRUE)
+dv_lin   <- attr(pred_lin, "decision.values")    # f(x) for linear SVM
+
+pred_rbf <- predict(svm_rbf, grid_xy, decision.values = TRUE)
+dv_rbf   <- attr(pred_rbf, "decision.values")    # f(x) for RBF SVM
+
+grid_lin <- cbind(grid_xy, f = as.numeric(dv_lin))
+grid_rbf <- cbind(grid_xy, f = as.numeric(dv_rbf))
+
+# Indices of support vectors (to highlight)
+sv_idx_lin <- svm_lin$index
+sv_idx_rbf <- svm_rbf$index
+
+# 4) Plot: Linear SVM (left)
+p_lin <- ggplot(df, aes(x1, x2)) +
+  # training points
+  geom_point(aes(color = y), size = 1.7, alpha = 0.9) +
+  # support vectors outlined
+  geom_point(data = df[sv_idx_lin, ], shape = 21, size = 3,
+             stroke = 0.9, color = "black", fill = NA) +
+  # decision boundary f(x)=0 (solid) and margins f=±1 (dashed)
+  geom_contour(data = grid_lin, aes(z = f), breaks = 0, color = "black", size = 1) +
+  geom_contour(data = grid_lin, aes(z = f), breaks = c(-1, 1),
+               color = "grey40", linetype = "dashed") +
+  scale_color_manual(values = c(`-1` = "blue", `1` = "red"),
+                     name = "Class", labels = c("-1", "+1")) +
+  coord_equal() +
+  labs(title = "Linear SVM", x = "x1", y = "x2",
+       subtitle = "Solid: decision boundary f(x)=0; Dashed: margins f(x)=±1") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+# 5) Plot: RBF SVM (right)
+p_rbf <- ggplot(df, aes(x1, x2)) +
+  geom_point(aes(color = y), size = 1.7, alpha = 0.9) +
+  geom_point(data = df[sv_idx_rbf, ], shape = 21, size = 3,
+             stroke = 0.9, color = "black", fill = NA) +
+  geom_contour(data = grid_rbf, aes(z = f), breaks = 0, color = "black", size = 1) +
+  geom_contour(data = grid_rbf, aes(z = f), breaks = c(-1, 1),
+               color = "grey40", linetype = "dashed") +
+  scale_color_manual(values = c(`-1` = "blue", `1` = "red"),
+                     name = "Class", labels = c("-1", "+1")) +
+  coord_equal() +
+  labs(title = "RBF (Gaussian) SVM", x = "x1", y = "x2",
+       subtitle = "Nonlinear boundary; support vectors circled") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+p_lin 
+p_rbf
+
+```
+
+
+# Clustering
+
+A short tour of unsupervised learning. We cluster a synthetic 5-D dataset with K-means; in practice you should standardize features (here we handle that in the plotting pipeline). This sets up the elbow and silhouette diagnostics.
+
+
+```{r}
+set.seed(7)
+n_k <- 900
+centers <- matrix(c(2,2,0,0,0,
+-2,0,2,0,0,
+0,-2,0,2,0), ncol = 5, byrow = TRUE)
+cl <- sample(1:3, n_k, replace = TRUE, prob = c(0.35, 0.35, 0.30))
+Xk <- matrix(rnorm(n_k * 5, sd = 0.7), n_k, 5) + centers[cl, ]
+dfk <- as_tibble(Xk)
+
+
+wcss <- function(k){kmeans(dfk, centers = k, nstart = 20)$tot.withinss}
+ks <- 1:8
+elbow_vals <- sapply(ks, wcss)
+tibble(k = ks, tot_within_ss = elbow_vals) %>%
+ggplot(aes(k, tot_within_ss)) + geom_line() + geom_point() +
+labs(title = "Elbow method", x = "k", y = "Total within-cluster SS")
+
+
+sil_of_k <- function(k){
+km <- kmeans(dfk, centers = k, nstart = 20)
+ss <- cluster::silhouette(km$cluster, dist(dfk))
+mean(ss[,3])
+}
+sil_vals <- sapply(2:8, sil_of_k)
+tibble(k = 2:8, avg_sil = sil_vals) %>%
+ggplot(aes(k, avg_sil)) + geom_line() + geom_point() +
+labs(title = "Average silhouette vs k", x = "k", y = "Average silhouette width")
+
+
+set.seed(7)
+km3 <- kmeans(dfk, centers = 3, nstart = 50)
+pc   <- prcomp(dfk, center = TRUE, scale. = TRUE)
+df_plot <- as_tibble(pc$x[,1:2]) %>% mutate(cluster = factor(km3$cluster))
+
+ggplot(df_plot, aes(PC1, PC2, color = cluster)) +
+geom_point(alpha = 0.6) +
+stat_ellipse(type = "norm", linetype = 2, linewidth = 0.5) +
+labs(title = "K-means clusters visualized via PCA", color = "Cluster")
+
+```
+
+# Causal Forest
+
+Fits `grf::causal_forest` on `(X, y, w)` with *honesty* and internal *orthogonalization*. We predict individualized treatment effects on the test set and report a forest-based ATE with a valid standard error. This is the “who benefits more?” piece.
+
+```{r}
+Xmat <- as.matrix(data %>% dplyr::select(starts_with("x")))
+
+cf <- causal_forest(
+X = Xmat, Y = data$y, W = data$w,
+num.trees = 2000, min.node.size = 5, honesty = TRUE, seed = 123
+)
+
+Xmat_test <- as.matrix(test %>% dplyr::select(starts_with("x")))
+tau_hat   <- predict(cf, Xmat_test)$predictions
+
+ate_cf <- average_treatment_effect(cf, target.sample = "all")
+ate_cf
+
+```
+
+The forest learns a complex \( \hat\tau(x) \). BLP projects it onto a simple linear summary over chosen features, yielding a table of coefficients. The intercept is a linearized baseline (close to ATE if features are centered); slopes show how effects vary with each covariate. This gives an interpretable “gradient of heterogeneity.”
+
+
+
+```{r}
+# BLP summary of heterogeneity (robust to grf version differences)
+# ---- Robust Best Linear Projection (works across grf versions) ----
+# Try the (X, Y, W) signature first; fall back to (X) only if needed.
+blp_obj <- tryCatch(
+  grf::best_linear_projection(cf, Xmat, data$y, data$w),
+  error = function(e) try(grf::best_linear_projection(cf, Xmat), silent = TRUE)
+)
+
+# Helper to extract a tidy coefficient table regardless of returned type
+tidy_blp <- function(blp, X) {
+  # Case 1: list with $coef (many grf versions)
+  if (is.list(blp) && !is.null(blp$coef)) {
+    est <- as.numeric(blp$coef)
+    nm  <- names(blp$coef)
+    return(tibble::tibble(term = nm, estimate = est))
+  }
+  # Case 2: matrix (coeffs in first column; rownames are terms if present)
+  if (is.matrix(blp)) {
+    est <- as.numeric(blp[, 1, drop = TRUE])
+    nm  <- rownames(blp)
+    if (is.null(nm)) {
+      # Guess names: intercept + X colnames
+      nm <- c("(Intercept)", colnames(X))
+      if (length(nm) != length(est)) nm <- paste0("beta", seq_along(est))
+    }
+    return(tibble::tibble(term = nm, estimate = est))
+  }
+  # Case 3: plain numeric vector
+  if (is.numeric(blp)) {
+    est <- as.numeric(blp)
+    # Try to infer whether there is an intercept
+    if (length(est) == ncol(X) + 1) {
+      nm <- c("(Intercept)", colnames(X))
+    } else if (length(est) == ncol(X)) {
+      nm <- colnames(X)
+    } else {
+      nm <- paste0("beta", seq_along(est))
+    }
+    return(tibble::tibble(term = nm, estimate = est))
+  }
+  # Fallback: show structure so you can see what came back
+  str(blp)
+  stop("Unexpected return type from best_linear_projection().")
+}
+
+blp_tbl <- tidy_blp(blp_obj, Xmat)
+blp_tbl
+
+```
+
+# Double Machine Learning (DML)
+Implements DML under selection on observables: cross-fitted outcome and propensity models feed an *orthogonal* AIPW score, delivering a \( \sqrt{n} \)-consistent ATE with valid SEs. Emphasize why cross-fitting (out-of-fold nuisances) removes first-order regularization bias.
+
+```{r}
+library(data.table)  # DoubleML expects a data.table
+
+dml_df <- data %>%
+dplyr::select(y, d = w, dplyr::starts_with("x")) %>%
+dplyr::mutate(d = as.numeric(d)) %>%
+data.table::as.data.table()
+
+dml_data <- DoubleMLData$new(dml_df, y_col = "y", d_cols = "d")
+
+ml_g <- lrn("regr.ranger", num.trees = 1000, min.node.size = 5)
+ml_m <- lrn("classif.ranger", predict_type = "prob", num.trees = 1000, min.node.size = 5)
+
+dml_irm <- DoubleMLIRM$new(dml_data, ml_g = ml_g, ml_m = ml_m, n_folds = 5, score = "ATE")
+dml_irm$fit()
+dml_irm$summary()
+
+```
+
+Implememting DML manually
+
+```{r}
+# ---- Manual DML (aligned to DoubleML; order-robust) ----
+# Goal: produce a manual DML estimate that matches DoubleML by using the same
+# sample splitting (folds), trimming, and comparable learners/hyper-params.
+
+# 0) Ensure data/learners exist (re-create if the user ran this chunk first)
+if (!exists("dml_df")) {
+  library(data.table)
+  dml_df <- data %>%
+    dplyr::select(y, d = w, dplyr::starts_with("x")) %>%
+    dplyr::mutate(d = as.numeric(d)) %>%
+    data.table::as.data.table()
+}
+if (!exists("dml_data")) dml_data <- DoubleMLData$new(dml_df, y_col = "y", d_cols = "d")
+if (!exists("ml_g")) ml_g <- lrn("regr.ranger", num.trees = 1000, min.node.size = 5)
+if (!exists("ml_m")) ml_m <- lrn("classif.ranger", predict_type = "prob", num.trees = 1000, min.node.size = 5)
+
+# 1) Create or reuse DoubleML with deterministic folds
+K_fixed <- 2          # keep K=2 to mirror earlier manual demo; change if you prefer K=5
+set.seed(2025)
+n <- nrow(dml_df)
+fold_id <- sample(rep(1:K_fixed, length.out = n))
+train_ids <- lapply(1:K_fixed, function(k) which(fold_id != k))
+test_ids  <- lapply(1:K_fixed, function(k) which(fold_id == k))
+
+if (!exists("dml_irm")) {
+  dml_irm <- DoubleMLIRM$new(dml_data, ml_g = ml_g, ml_m = ml_m,
+                             n_folds = K_fixed, score = "ATE",
+                             trimming_threshold = 1e-3)
+  dml_irm$set_sample_splitting(list(train_ids = train_ids, test_ids = test_ids))
+  dml_irm$fit()
+} else {
+  # If dml_irm exists, prefer its folds; otherwise fall back to our deterministic ones
+  if (!is.null(dml_irm$smpls$train_ids) && length(dml_irm$smpls$train_ids) > 0) {
+    train_ids <- dml_irm$smpls$train_ids
+    test_ids  <- dml_irm$smpls$test_ids
+    K_fixed   <- length(train_ids)
+  } else {
+    dml_irm$set_sample_splitting(list(train_ids = train_ids, test_ids = test_ids))
+    dml_irm$fit()
+  }
+}
+
+# 2) Read trimming threshold & mirror key hyper-parameters
+trim <- if (!is.null(dml_irm$trimming_threshold)) dml_irm$trimming_threshold else 0
+get_param <- function(learner, name, default = NULL) {
+  val <- try(learner$param_set$values[[name]], silent = TRUE)
+  if (inherits(val, "try-error") || is.null(val)) default else val
+}
+p_num_trees_g <- get_param(ml_g, "num.trees", 1000)
+p_min_node_g  <- get_param(ml_g, "min.node.size", 5)
+p_mtry_g      <- get_param(ml_g, "mtry", floor(sqrt(ncol(dml_df) - 2)))
+
+p_num_trees_m <- get_param(ml_m, "num.trees", 1000)
+p_min_node_m  <- get_param(ml_m, "min.node.size", 5)
+p_mtry_m      <- get_param(ml_m, "mtry", floor(sqrt(ncol(dml_df) - 2)))
+
+# 3) Manual cross-fitted scores on the *same* folds
+library(ranger)
+df_use <- as.data.frame(dml_df)
+X_cols <- grepl("^x", names(df_use))
+one_fold_scores <- vector("list", K_fixed)
+
+set.seed(2025)
+for (k in seq_len(K_fixed)) {
+  tr <- train_ids[[k]]; te <- test_ids[[k]]
+  d_tr <- df_use[tr, , drop = FALSE]
+  d_te <- df_use[te, , drop = FALSE]
+
+  # Propensity e(X), prob of class "1"
+  m_fit <- ranger(
+    as.factor(d) ~ .,
+    data    = transform(d_tr, d = factor(d, levels = c(0,1)))[, c("d", names(df_use)[X_cols]), drop = FALSE],
+    probability = TRUE,
+    num.trees   = p_num_trees_m,
+    min.node.size = p_min_node_m,
+    mtry        = p_mtry_m,
+    respect.unordered.factors = "order",
+    seed = 2025
+  )
+  m_hat_mat <- predict(m_fit, d_te[, names(df_use)[X_cols], drop = FALSE])$predictions
+  stopifnot("1" %in% colnames(m_hat_mat))
+  m_hat <- as.numeric(m_hat_mat[, "1"])
+
+  # Outcome models μ1(X), μ0(X)
+  d1_tr <- d_tr[d_tr$d == 1, c("y", names(df_use)[X_cols]), drop = FALSE]
+  d0_tr <- d_tr[d_tr$d == 0, c("y", names(df_use)[X_cols]), drop = FALSE]
+
+  mu1_fit <- ranger(y ~ ., data = d1_tr, num.trees = p_num_trees_g,
+                    min.node.size = p_min_node_g, mtry = p_mtry_g,
+                    respect.unordered.factors = "order", seed = 2025)
+  mu0_fit <- ranger(y ~ ., data = d0_tr, num.trees = p_num_trees_g,
+                    min.node.size = p_min_node_g, mtry = p_mtry_g,
+                    respect.unordered.factors = "order", seed = 2025)
+
+  mu1_hat <- as.numeric(predict(mu1_fit, d_te[, names(df_use)[X_cols], drop = FALSE])$predictions)
+  mu0_hat <- as.numeric(predict(mu0_fit, d_te[, names(df_use)[X_cols], drop = FALSE])$predictions)
+
+  # Orthogonal score with the same trimming
+  m_t   <- pmin(pmax(m_hat, trim), 1 - trim)
+  y_t   <- d_te$y
+  d_t   <- d_te$d
+  psi_t <- (mu1_hat - mu0_hat) + d_t * (y_t - mu1_hat) / m_t - (1 - d_t) * (y_t - mu0_hat) / (1 - m_t)
+
+  one_fold_scores[[k]] <- psi_t
+}
+
+psi <- unlist(one_fold_scores)
+manual_aligned <- list(ATE = mean(psi), SE = sqrt(var(psi) / length(psi)))
+
+# 4) Side-by-side
+tibble::tibble(
+  Estimator = c("DoubleML (IRM)", "Manual DML (aligned)"),
+  ATE       = c(dml_irm$coef, manual_aligned$ATE),
+  SE        = c(dml_irm$se,   manual_aligned$SE)
+)
+
+```
+
+# Comparing Various Estimators
+
+A compact table that juxtaposes predictive test RMSEs (OLS / lasso / RF) with causal ATEs (causal-forest, DML). Use it to hammer home that high predictive accuracy does not guarantee correct causal effects; identification requires the right score/assumptions.
+
+
+```{r}
+ols_fit  <- lm(y ~ ., data = train)
+ols_rmse <- sqrt(mean((predict(ols_fit, newdata = test) - y_test)^2))
+
+cv_lasso <- cv.glmnet(X_train, y_train, alpha = 1, nfolds = 10, standardize = TRUE)
+yhat_1se <- as.numeric(predict(cv_lasso, newx = X_test, s = "lambda.1se"))
+rmse_1se <- sqrt(mean((yhat_1se - y_test)^2))
+
+rf_fit  <- ranger(y ~ ., data = train, num.trees = 1000,
+mtry = floor(sqrt(ncol(train)-1)), min.node.size = 5)
+rf_pred <- predict(rf_fit, test)$predictions
+rf_rmse <- sqrt(mean((rf_pred - y_test)^2))
+
+tibble(
+Estimator = c("OLS (predictive)", "LASSO (1se)", "Random Forest (predictive)",
+"Causal Forest ATE", "DML (package)", "DML (manual)"),
+Metric    = c("Test RMSE", "Test RMSE", "Test RMSE",
+"ATE (SE)", "ATE (SE)", "ATE (SE)"),
+Value     = c(
+sprintf("%.3f", ols_rmse),
+sprintf("%.3f", rmse_1se),
+sprintf("%.3f", rf_rmse),
+sprintf("%.3f (%.3f)", ate_cf[["estimate"]], ate_cf[["std.err"]]),
+sprintf("%.3f (%.3f)", dml_irm$coef, dml_irm$se),
+sprintf("%.3f (%.3f)", manual_aligned$ATE, manual_aligned$SE)
+)
+) %>% kableExtra::kable()
+
+```
+
+
+
+# The Merits of DML
+
+Monte-Carlo over *confounding strength* (how strongly \(D\) depends on \(X\)). Kernel densities show:  
+- **Naïve LASSO** (penalizes `D`) is left-shifted (shrinkage bias).  
+- **Plug-in (no cross-fit)** drifts as confounding grows (regularization error leaks into the target).  
+- **DML (cross-fitted)** stays centered at the true \( \theta_0 \), illustrating the value of the orthogonal score + cross-fitting.
+
+
+```{r}
+# ---- dml_density_plot_chernozhukov_style ----
+suppressPackageStartupMessages({
+  library(glmnet); library(ggplot2); library(dplyr); library(tidyr); library(purrr)
+})
+
+set.seed(123)
+
+## 1) High-dimensional partially linear DGP
+##    Y = θ0 * D + g(X) + ε,   D = m(X) + ν,  X ∈ R^p with sparse signals
+simulate_plr <- function(n = 500, p = 200, s = 10, theta0 = 1, conf_strength = 1) {
+  X <- matrix(rnorm(n * p), n, p); colnames(X) <- paste0("x", 1:p)
+  idx_g <- sample.int(p, s); beta_g <- numeric(p); beta_g[idx_g] <- rnorm(s, sd = 1)
+  idx_m <- sample.int(p, s); beta_m <- numeric(p); beta_m[idx_m] <- rnorm(s, sd = 1)
+
+  gX <- as.vector(X %*% beta_g)
+  mX <- as.vector(conf_strength * (X %*% beta_m))  # scale confounding
+
+  v <- rnorm(n); eps <- rnorm(n)
+  D <- mX + v
+  Y <- theta0 * D + gX + eps
+  list(Y = Y, D = D, X = X, theta0 = theta0)
+}
+
+## 2) Estimators
+# 2.1 Naive LASSO that penalizes D -> shrinkage bias toward 0
+est_naive_lasso <- function(Y, D, X){
+  Z <- cbind(D = D, X)
+  fit <- cv.glmnet(Z, Y, alpha = 1, standardize = TRUE,
+                   penalty.factor = rep(1, ncol(Z)))        # penalize D too
+  as.numeric(coef(fit, s = "lambda.min")[2])                  # coef on D
+}
+
+# 2.2 Plug-in w/out cross-fitting: partial out on same sample -> regularization bias
+est_plugin_noCF <- function(Y, D, X){
+  fitY <- cv.glmnet(X, Y, alpha = 1, standardize = TRUE)
+  fitD <- cv.glmnet(X, D, alpha = 1, standardize = TRUE)
+  muhat <- as.numeric(predict(fitY, X, s = "lambda.min"))
+  mhat  <- as.numeric(predict(fitD, X, s = "lambda.min"))
+  ytil  <- Y - muhat
+  dtil  <- D - mhat
+  coef(lm(ytil ~ dtil))[2]
+}
+
+# 2.3 DML: cross-fitted partialling-out (K=2)
+est_dml <- function(Y, D, X, K = 2){
+  n <- length(Y); folds <- sample(rep(1:K, length.out = n))
+  ytil <- numeric(n); dtil <- numeric(n)
+  for(k in 1:K){
+    tr <- which(folds != k); te <- which(folds == k)
+    fitY <- cv.glmnet(X[tr, , drop=FALSE], Y[tr], alpha = 1, standardize = TRUE)
+    fitD <- cv.glmnet(X[tr, , drop=FALSE], D[tr], alpha = 1, standardize = TRUE)
+    muhat <- as.numeric(predict(fitY, X[te, , drop=FALSE], s = "lambda.min"))
+    mhat  <- as.numeric(predict(fitD, X[te, , drop=FALSE], s = "lambda.min"))
+    ytil[te] <- Y[te] - muhat
+    dtil[te] <- D[te] - mhat
+  }
+  as.numeric(coef(lm(ytil ~ dtil))[2])
+}
+
+## 3) Monte-Carlo across confounding strengths
+run_mc <- function(conf_strength, reps = 300, n = 500, p = 200, s = 10, theta0 = 1){
+  tibble(rep = 1:reps) |>
+    mutate(sim = map(rep, ~ simulate_plr(n, p, s, theta0, conf_strength))) |>
+    mutate(
+      naive = map_dbl(sim, ~ est_naive_lasso(.$Y, .$D, .$X)),
+      plug  = map_dbl(sim, ~ est_plugin_noCF(.$Y, .$D, .$X)),
+      dml   = map_dbl(sim, ~ est_dml(.$Y, .$D, .$X))
+    ) |>
+    select(-sim) |>
+    mutate(conf = factor(paste0("conf = ", conf_strength)))
+}
+
+conf_grid <- c(0.5, 1.0, 2.0)
+mc <- map_df(conf_grid, ~ run_mc(.x, reps = 300))
+
+mc_long <- mc |>
+  pivot_longer(cols = c(naive, plug, dml),
+               names_to = "method", values_to = "theta_hat") |>
+  mutate(
+    method = factor(method,
+                    levels = c("naive", "plug", "dml"),
+                    labels = c("Naive LASSO (penalize D)",
+                               "Plug-in (no cross-fit)",
+                               "DML (cross-fitted)"))
+  )
+
+## 4) Density-style plot (clean typography; true θ line; clear legend)
+theta0 <- 1.0
+x_center <- theta0; x_span <- 0.35
+x_lim <- c(x_center - x_span, x_center + x_span)
+
+cols <- c("Naive LASSO (penalize D)" = "#7f7f7f",
+          "Plug-in (no cross-fit)"   = "#1f77b4",
+          "DML (cross-fitted)"       = "#2ca02c")
+
+p_den <- ggplot(mc_long, aes(x = theta_hat, colour = method, fill = method)) +
+  geom_density(alpha = 0.18, adjust = 1.0, linewidth = 1.2) +
+  geom_vline(xintercept = theta0, linetype = "dashed", colour = "red3", linewidth = 1) +
+  facet_wrap(~ conf, nrow = 1, scales = "free_y") +
+  scale_color_manual(values = cols, name = NULL) +
+  scale_fill_manual(values = cols, guide = "none") +
+  coord_cartesian(xlim = x_lim) +
+  labs(title = "Why orthogonal, cross-fitted DML reduces regularization bias",
+       subtitle = "High-dimensional PLR:  Y = θ·D + g(X) + ε,    D = m(X) + ν   (sparse X).   Red dashed = true θ₀",
+       x = expression(hat(theta)), y = "Density") +
+  theme_minimal(base_size = 15) +
+  theme(strip.text = element_text(face = "bold"),
+        legend.position = "top",
+        panel.spacing.x = unit(12, "pt"))
+
+print(p_den)
+
+```
+
