@@ -1,0 +1,207 @@
+---
+title: "OLS, Omitted Variable Bias, Bootstrap, and Fisher's Test"
+author: "Huan Deng"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    df_print: paged
+---
+
+## Overview
+
+This handout covers:
+1. Simulating data where **ability (A)** affects both **college (D)** and **income (Y)**.  
+2. OLS **short vs long** and the **OVB identity**.  
+3. **Robust** standard errors and a clean regression **table**.  
+4. A loop-based **bootstrap** of the college effect.  
+5. **Fisher’s Randomization Test**.
+
+- OLS/OVB/Bootstrap requires: **modelsummary**, **broom**, **sandwich**, **lmtest**.  
+- Fisher section requires only: **randomizr**, **ggplot2**.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## Install and load packages (OLS/OVB/Bootstrap)
+
+```{r install-load}
+need <- c("modelsummary", "broom", "sandwich", "lmtest")
+to_install <- need[!(need %in% rownames(installed.packages()))]
+if (length(to_install) > 0) {
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+library(modelsummary); library(broom); library(sandwich); library(lmtest)
+```
+
+## Simulate data
+
+```{r simulate-data}
+set.seed(123)
+n <- 5000
+
+A <- rnorm(n, mean = 0, sd = 1)
+
+alpha0 <- -0.4
+alpha1 <-  1.0
+pD <- 1 / (1 + exp(-(alpha0 + alpha1 * A)))
+D  <- rbinom(n = n, size = 1, prob = pD)
+
+beta0 <- 30
+beta1 <-  8
+beta2 <- 10
+sigma <- 8
+Y <- beta0 + beta1 * D + beta2 * A + rnorm(n, mean = 0, sd = sigma)
+
+df <- data.frame(Y = Y, D = D, A = A)
+```
+
+## OLS: short vs. long
+
+```{r ols-models}
+m_short <- lm(Y ~ D, data = df)
+m_long  <- lm(Y ~ D + A, data = df)
+
+summary(m_short); summary(m_long)
+b_short <- coef(m_short)["D"]; b_long <- coef(m_long)["D"]
+```
+
+## Omitted Variable Bias (OVB) identity
+
+```{r ovb-identity}
+beta_A_hat <- coef(m_long)["A"]
+pi_hat     <- coef(lm(A ~ D, data = df))["D"]
+b_short_pred <- b_long + beta_A_hat * pi_hat
+
+ovb_check <- data.frame(
+  quantity = c("Short estimate  (Y ~ D)",
+               "Long estimate   (Y ~ D + A)",
+               "beta_A_hat (A in long)",
+               "pi_hat (from A ~ D)",
+               "Predicted short = long + beta_A_hat * pi_hat",
+               "TRUE causal beta1"),
+  value = c(b_short, b_long, beta_A_hat, pi_hat, b_short_pred, beta1)
+)
+ovb_check
+```
+
+## Robust SEs and a regression table
+
+```{r se-and-table}
+vc_short <- vcovHC(m_short, type = "HC1")
+vc_long  <- vcovHC(m_long,  type = "HC1")
+
+modelsummary::msummary(
+  list("Short: omit A" = m_short, "Long: include A" = m_long),
+  gof_map = c("nobs", "r.squared", "adj.r.squared"),
+  stars = TRUE,
+  vcov = list(vc_short, vc_long),
+  title = "OLS with Robust (HC1) Standard Errors"
+)
+```
+
+## Bootstrap the college effect (loop)
+
+```{r bootstrap}
+set.seed(456)
+B <- 1000
+boot_betas <- numeric(B)
+n_rows <- nrow(df)
+
+for (b in 1:B) {
+  idx  <- sample.int(n_rows, size = n_rows, replace = TRUE)
+  df_b <- df[idx, ]
+  m_b  <- lm(Y ~ D + A, data = df_b)
+  boot_betas[b] <- coef(m_b)["D"]
+}
+
+quantile(boot_betas, probs = c(0.025, 0.5, 0.975))
+```
+
+---
+
+## Fisher’s Randomization Test 
+
+### Install (no need to `library()` — we will use `pkg::func`)
+
+```{r fisher-install, message=TRUE}
+fneed <- c("randomizr","ggplot2")
+to_install_f <- fneed[!(fneed %in% rownames(installed.packages()))]
+if (length(to_install_f) > 0) {
+  install.packages(to_install_f, repos = "https://cloud.r-project.org")
+}
+```
+
+### Fisher p-value function and power analysis 
+
+```{r fisher-full, eval=TRUE}
+set.seed(20250901)  # reproducibility
+
+# Fisher p-value under a sharp null with constant treatment effect tau
+fisher_p_value <- function(n = 100, max_perm = 1000, effect = 0) {
+  # Generate data
+  Y0 <- rnorm(n)          # potential outcome under control
+  Y1 <- Y0 + effect       # constant treatment effect
+  W  <- randomizr::complete_ra(N = n, prob = 0.5)  # realized assignment
+  Y_obs <- Y1*W + Y0*(1 - W)
+
+  # Observed difference in means
+  obs_stat <- mean(Y_obs[W == 1]) - mean(Y_obs[W == 0])
+
+  # Randomization distribution via permutation matrix
+  declaration <- randomizr::declare_ra(N = n)
+  perms <- randomizr::obtain_permutation_matrix(declaration, maximum_permutations = max_perm)
+
+  perm_stats <- numeric(ncol(perms))
+  for (i in 1:ncol(perms)) {
+    W_perm <- perms[, i]
+    # Impute missing potential outcomes under sharp null tau
+    Y_obs_perm <- Y_obs
+    perm_stats[i] <- mean(Y_obs_perm[W_perm == 1]) - mean(Y_obs_perm[W_perm == 0])
+  }
+
+  # Two-sided p-value
+  mean(abs(perm_stats) >= abs(obs_stat))
+}
+
+# Example p-value (full settings)
+p_value <- fisher_p_value(n = 100, max_perm = 10000, effect = 0.8)
+cat("Fisher's Exact P-Value:", p_value, "\n")
+
+# Power curve
+power_analysis <- function(effect_sizes, N = 100, num_simulations = 1000, max_perm = 1000, alpha = 0.05) {
+  power_results <- numeric(length(effect_sizes))
+  for (j in seq_along(effect_sizes)) {
+    effect <- effect_sizes[j]
+    rejections <- 0
+    for (i in 1:num_simulations) {
+      p_val <- fisher_p_value(N, max_perm, effect)
+      if (p_val < alpha) rejections <- rejections + 1
+    }
+    power_results[j] <- rejections / num_simulations
+  }
+  data.frame(Effect_Size = effect_sizes, Power = power_results)
+}
+
+effect_sizes <- seq(0, 0.2, by = 0.01)
+start.time <- Sys.time()
+power_results <- power_analysis(effect_sizes, N = 1000, num_simulations = 500, max_perm = 1000, alpha = 0.05)
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+print(head(power_results)); print(tail(power_results)); print(time.taken)
+
+# Plot
+ggplot2::ggplot(power_results, ggplot2::aes(x = Effect_Size, y = Power)) +
+  ggplot2::geom_line() + ggplot2::geom_point() +
+  ggplot2::labs(title = "Power Analysis of Fisher's Test", x = "Treatment Effect Size", y = "Power") +
+  ggplot2::theme_minimal()
+```
+
+## Key connections for class
+
+- OLS **short vs long** + **OVB** shows how confounding by ability biases linear regression.  
+- Fisher’s **sharp null** randomization test uses the randomization distribution to compute exact p-values.  
+- The **power curve** shows detection probability rising with effect size.
