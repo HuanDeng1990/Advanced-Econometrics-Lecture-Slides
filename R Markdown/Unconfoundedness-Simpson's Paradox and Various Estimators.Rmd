@@ -1,0 +1,307 @@
+---
+title: "Simpson's Paradox & Treatment Effect Estimation (Simulated)"
+author: "Huan Deng"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+set.seed(123)
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+# Helper to install/load packages quietly
+pkg <- function(x){
+  if (!requireNamespace(x, quietly = TRUE)) {
+    install.packages(x, repos = "https://cloud.r-project.org")
+  }
+  suppressPackageStartupMessages(library(x, character.only = TRUE))
+}
+
+pkg("dplyr")
+pkg("ggplot2")
+pkg("MatchIt")     # PS subclassification
+pkg("WeightIt")   # IPW weights
+pkg("survey")     # weighted regression
+```
+
+# Part 1. Simpson's Paradox (Simulated)
+
+We simulate two groups (A = high baseline, B = low baseline). Treatment effects are **positive within each group**, but treated units are more likely to come from Group B (the worse baseline group). The pooled comparison appears negative (Simpson's paradox).
+
+```{r simpson-sim}
+n <- 5000
+G <- rbinom(n, 1, 0.5)  # 1=A, 0=B
+muA <- 80; muB <- 50    # baseline means
+tau <- 10               # true TE within each group
+
+# Treatment assignment favored toward low-baseline group B
+pD_A <- 0.20
+pD_B <- 0.80
+D <- ifelse(G==1, rbinom(n,1,pD_A), rbinom(n,1,pD_B))
+
+# Outcomes
+mu0 <- ifelse(G==1, muA, muB)
+Y <- mu0 + tau*D + rnorm(n, 0, 10)
+
+dat_sp <- data.frame(G=factor(G, labels=c("B","A")), D=factor(D), Y)
+dplyr::glimpse(dat_sp)
+```
+
+## Naïve difference in means (pooled)
+
+```{r simpson-naive}
+naive_diff <- with(dat_sp, mean(Y[D=="1"]) - mean(Y[D=="0"]))
+naive_diff
+```
+
+## Within-group treatment effects
+
+```{r simpson-within}
+within_te <- dat_sp |>
+  dplyr::group_by(G) |>
+  dplyr::summarise(TE = mean(Y[D=="1"]) - mean(Y[D=="0"]),
+                   n = dplyr::n())
+within_te
+```
+
+## Correct stratified ATE (weighted by group shares)
+
+```{r simpson-strat}
+wA <- mean(dat_sp$G=="A")
+wB <- mean(dat_sp$G=="B")
+tau_A <- within_te$TE[within_te$G=="A"]
+tau_B <- within_te$TE[within_te$G=="B"]
+strat_ate <- wA*tau_A + wB*tau_B
+c(naive_diff = naive_diff, stratified_ATE = strat_ate)
+```
+
+## Visualization
+
+```{r simpson-plot, fig.height=4, fig.width=7}
+ggplot(dat_sp, aes(x=D, y=Y, fill=D)) +
+  geom_boxplot() +
+  facet_wrap(~G) +
+  scale_fill_discrete(name="Treatment", labels=c("Control","Treated")) +
+  labs(x="Treatment", y="Outcome", title="Simpson's Paradox Simulation") +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+# Part 2. Training Program (Selection on Observables)
+
+We simulate a government assigning training based on education, baseline income, presence of young kids, and age. Treatment assignment uses a logistic rule; outcomes depend on covariates plus a *constant* treatment effect. Under **CIA (unconfoundedness)**, appropriate estimators should recover the ATE when overlap is decent.
+
+```{r train-sim}
+logit <- function(x) 1/(1+exp(-x))
+
+simulate_training <- function(N=8000){
+  edu <- rbinom(N,1,0.5)     # 1=College+, 0=HS or less
+  base_inc <- rnorm(N, mean = ifelse(edu==1, 30, 20), sd=8)
+  kids <- rbinom(N,1,0.35)   # has young kids
+  age <- pmin(pmax(round(rnorm(N,36,7)),22),55)
+  
+  # Government targeting rule (higher prob if HSorLess, lower income, has kids)
+  linp <- -0.2 - 0.20*edu - 0.02*base_inc + 0.20*kids - 0.005*age
+  e_true <- 1/(1+exp(-linp))           # plogis(linp)
+  D <- rbinom(N, 1, e_true)
+  
+  # Outcomes: post-training earnings (k$)
+  mu0 <- 10 + 0.8*base_inc + 2*edu -1.5*kids + 0.1*age
+  tau <- 3  # constant TE for clarity
+  Y0 <- mu0 + rnorm(N,0,5)
+  Y1 <- mu0 + tau + rnorm(N,0,5)
+  Y <- ifelse(D==1, Y1, Y0)
+  
+  data.frame(edu, base_inc, kids, age, D, Y, e_true, Y0, Y1)
+}
+
+dat <- simulate_training(8000)
+true_ATE <- mean(dat$Y1 - dat$Y0)
+true_ATE
+```
+
+## Quick overlap check (estimated propensity)
+
+```{r overlap, fig.height=4.5, fig.width=7}
+ps_fit <- glm(D ~ edu + base_inc + kids + age, data=dat, family=binomial)
+dat$e_hat <- as.numeric(fitted(ps_fit))
+
+ggplot(dat, aes(x=e_hat, fill=factor(D))) +
+  geom_histogram(alpha=0.6, bins=30, position="identity") +
+  scale_fill_discrete(name="Treatment", labels=c("Control","Treated")) +
+  labs(x="Estimated propensity", y="Count", title="Propensity Overlap Check") +
+  theme_minimal(base_size = 13)
+```
+
+## Estimators
+
+### 1) Naïve difference in means
+
+```{r est-naive}
+est_naive <- with(dat, mean(Y[D==1]) - mean(Y[D==0]))
+est_naive
+```
+
+### 2) OLS with controls
+
+```{r est-ols}
+est_ols <- coef(lm(Y ~ D + edu + base_inc + kids + age, data=dat))["D"]
+est_ols
+```
+
+### 3) Propensity score stratification (subclassification) — using `MatchIt`
+
+We create 5 subclasses by the estimated propensity score, then compute a subclass-weighted difference in means (ATE target).
+
+```{r est-ps-subclass}
+m.out <- matchit(D ~ edu + base_inc + kids + age, data=dat,
+                 method="subclass", subclass=5, estimand="ATE")
+# Extract subclass labels and compute subclass-specific diffs
+md <- MatchIt::match.data(m.out)
+sub_diffs <- md |>
+  dplyr::group_by(subclass) |>
+  dplyr::summarise(tau_j = mean(Y[D==1]) - mean(Y[D==0]),
+                   n_j = dplyr::n())
+# Weight subclasses by their sample share
+est_ps_subclass <- with(sub_diffs, sum((n_j/sum(n_j)) * tau_j))
+list(subclass_diffs = sub_diffs, ATE_ps_subclass = est_ps_subclass)
+```
+
+### 4) Inverse Probability Weighting (IPW) — using `WeightIt` + `survey`
+
+```{r est-ipw}
+w.out <- weightit(D ~ edu + base_inc + kids + age, data=dat,
+                  method="ps", estimand="ATE")
+dat$w_ipw <- w.out$weights
+
+des_ipw <- svydesign(~1, weights=~w_ipw, data=dat)
+est_ipw <- coef(svyglm(Y ~ D, design=des_ipw))["D"]
+est_ipw
+```
+
+### 5) Augmented IPW (AIPW) — custom implementation
+
+```{r est-aipw}
+# Propensity
+ps <- glm(D ~ edu + base_inc + kids + age, data=dat, family=binomial)$fitted
+
+# Outcome models
+mu1_hat <- predict(lm(Y ~ edu + base_inc + kids + age, data=dat[dat$D==1,]), newdata=dat)
+mu0_hat <- predict(lm(Y ~ edu + base_inc + kids + age, data=dat[dat$D==0,]), newdata=dat)
+
+# AIPW estimating equation
+term1 <- mu1_hat - mu0_hat
+term2 <- dat$D       * (dat$Y - mu1_hat) / ps
+term3 <- (1 - dat$D) * (dat$Y - mu0_hat) / (1 - ps)
+
+est_aipw <- mean(term1 + term2 - term3)
+est_aipw
+```
+
+## Summary: compare estimates to the true ATE
+
+```{r compare}
+c(True_ATE = true_ATE,
+  Naive = est_naive,
+  OLS = est_ols,
+  PS_Subclass = est_ps_subclass,
+  IPW = unname(est_ipw),
+  AIPW = est_aipw)
+```
+
+---
+
+# Part 3. Doubly Robust (DR) Illustration: When One Model Is Wrong
+
+We stress‑test the **AIPW (doubly robust)** estimator by deliberately misspecifying either the **propensity score model** or the **outcome regression**, and then both.  
+Under standard regularity, AIPW is consistent if **either** the propensity model **or** the outcome model is correctly specified (but not necessarily both).
+
+We reuse `dat` from Part 2.
+
+```{r dr-helpers}
+# AIPW helper that accepts arbitrary ps and outcome predictions
+aipw_est <- function(Y, D, ps, mu1_hat, mu0_hat){
+  term1 <- mu1_hat - mu0_hat
+  term2 <- D       * (Y - mu1_hat) / ps
+  term3 <- (1 - D) * (Y - mu0_hat) / (1 - ps)
+  mean(term1 + term2 - term3)
+}
+```
+
+## Model Specifications
+
+- **Propensity score (PS):**
+  - **Correct PS**: logistic with `edu + base_inc + kids + age` (matches DGP).
+  - **Misspecified PS**: logistic with only `edu + kids` (omits key confounders `base_inc`, `age`).
+
+- **Outcome regressions (OR):**
+  - **Correct OR**: linear model `Y ~ edu + base_inc + kids + age` (matches DGP mean function, up to noise).
+  - **Misspecified OR**: linear model `Y ~ edu + kids` (omits `base_inc`, `age`).
+
+```{r dr-models}
+# PS
+ps_good <- glm(D ~ edu + base_inc + kids + age, data=dat, family=binomial)$fitted
+ps_bad  <- glm(D ~ edu + kids,                 data=dat, family=binomial)$fitted
+
+# Outcome models
+m1_good <- lm(Y ~ edu + base_inc + kids + age, data=dat[dat$D==1,])
+m0_good <- lm(Y ~ edu + base_inc + kids + age, data=dat[dat$D==0,])
+mu1_good <- predict(m1_good, newdata = dat)
+mu0_good <- predict(m0_good, newdata = dat)
+
+m1_bad <- lm(Y ~ edu + kids, data=dat[dat$D==1,])
+m0_bad <- lm(Y ~ edu + kids, data=dat[dat$D==0,])
+mu1_bad <- predict(m1_bad, newdata = dat)
+mu0_bad <- predict(m0_bad, newdata = dat)
+```
+
+## Estimates Under Correct vs. Misspecified Pieces
+
+We report:
+- **IPW** using good vs. bad PS;
+- **Outcome regression (RA)** using good vs. bad outcome models;
+- **AIPW (DR)** in three combinations: (good PS, bad OR), (bad PS, good OR), and (bad PS, bad OR).
+
+```{r dr-estimates}
+library(dplyr)
+
+# IPW with good/bad PS (stabilized HT form)
+ipw_ht <- function(Y, D, ps){
+  num1 <- sum(D * Y / ps);     den1 <- sum(D / ps)
+  num0 <- sum((1-D) * Y / (1-ps)); den0 <- sum((1-D) / (1-ps))
+  (num1/den1) - (num0/den0)
+}
+ipw_good <- ipw_ht(dat$Y, dat$D, ps_good)
+ipw_bad  <- ipw_ht(dat$Y, dat$D, ps_bad)
+
+# Regression adjustment (RA): average of predicted contrasts
+ra_good <- mean(mu1_good - mu0_good)
+ra_bad  <- mean(mu1_bad  - mu0_bad)
+
+# AIPW combos
+aipw_goodPS_badOR <- aipw_est(dat$Y, dat$D, ps_good, mu1_bad,  mu0_bad)
+aipw_badPS_goodOR <- aipw_est(dat$Y, dat$D, ps_bad,  mu1_good, mu0_good)
+aipw_badPS_badOR  <- aipw_est(dat$Y, dat$D, ps_bad,  mu1_bad,  mu0_bad)
+
+res_dr <- tibble::tibble(
+  Estimator = c("True ATE",
+                "IPW (good PS)", "IPW (bad PS)",
+                "RA  (good OR)", "RA  (bad OR)",
+                "AIPW (good PS, bad OR)",
+                "AIPW (bad PS, good OR)",
+                "AIPW (bad PS, bad OR)"),
+  Value = c(true_ATE, ipw_good, ipw_bad, ra_good, ra_bad,
+            aipw_goodPS_badOR, aipw_badPS_goodOR, aipw_badPS_badOR)
+)
+
+res_dr
+```
+
+### Takeaways
+
+- **IPW** is consistent only when the **PS is correctly specified** (compare “IPW good PS” vs “IPW bad PS”).  
+- **Outcome regression (RA)** is consistent only when the **outcome model is correctly specified**.  
+- **AIPW** remains close to the **True ATE** when **either** the PS **or** the OR is correct (rows “AIPW (good PS, bad OR)” and “AIPW (bad PS, good OR)”).  
+- When **both** PS and OR are misspecified, **AIPW** also fails (row “AIPW (bad PS, bad OR)”).
+
+You can change which covariates are omitted, or add nonlinearities (e.g., include `base_inc^2` in the DGP but not in the models) to create more dramatic gaps.
